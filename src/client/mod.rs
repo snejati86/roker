@@ -8,13 +8,17 @@ use tracing::{debug, error, info};
 #[derive(Clone)]
 pub struct Publisher {
     broker: Arc<Broker>,
+    #[allow(dead_code)]  // This field is used for identification but not directly accessed
     client_id: ClientId,
 }
 
 impl Publisher {
     /// Create a new publisher
     pub fn new(broker: Arc<Broker>, client_id: ClientId) -> Self {
-        debug!("Creating new publisher with client ID: {}", client_id.as_str());
+        debug!(
+            "Creating new publisher with client ID: {}",
+            client_id.as_str()
+        );
         Self { broker, client_id }
     }
 
@@ -50,7 +54,10 @@ pub struct Subscriber {
 impl Subscriber {
     /// Create a new subscriber
     pub fn new(broker: Arc<Broker>, client_id: ClientId) -> Self {
-        debug!("Creating new subscriber with client ID: {}", client_id.as_str());
+        debug!(
+            "Creating new subscriber with client ID: {}",
+            client_id.as_str()
+        );
         Self { broker, client_id }
     }
 
@@ -73,9 +80,12 @@ impl Subscriber {
 
     /// Receive multiple messages
     pub fn receive_batch(&self, max_messages: usize) -> Result<Vec<Message>> {
-        debug!("Attempting to receive batch of up to {} messages", max_messages);
+        debug!(
+            "Attempting to receive batch of up to {} messages",
+            max_messages
+        );
         let mut messages = Vec::with_capacity(max_messages);
-        
+
         for _ in 0..max_messages {
             match self.receive() {
                 Ok(message) => messages.push(message),
@@ -93,7 +103,7 @@ impl Subscriber {
     /// Receive a message with timeout
     pub fn receive_timeout(&self, timeout: Duration) -> Result<Message> {
         let start = std::time::Instant::now();
-        
+
         while start.elapsed() < timeout {
             match self.receive() {
                 Ok(message) => return Ok(message),
@@ -107,4 +117,4 @@ impl Subscriber {
 
         Err(crate::error::Error::Timeout)
     }
-} 
+}

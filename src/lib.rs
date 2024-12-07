@@ -1,5 +1,5 @@
 //! A high-performance shared memory broker for pub/sub communication.
-//! 
+//!
 //! This library provides a broker that uses shared memory for fast inter-process
 //! communication using a publish/subscribe pattern.
 
@@ -8,7 +8,7 @@ pub mod client;
 pub mod error;
 mod topic;
 
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -43,6 +43,12 @@ impl Default for BrokerConfig {
 /// Unique identifier for a client
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClientId(Uuid);
+
+impl Default for ClientId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ClientId {
     /// Create a new random client ID

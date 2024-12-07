@@ -3,13 +3,14 @@ mod ring_buffer;
 use crate::error::{Error, Result};
 use crate::topic::TopicMatcher;
 use crate::{BrokerConfig, BrokerStats, ClientId, Message, Topic};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use ring_buffer::RingBuffer;
 use shared_memory::{Shmem, ShmemConf};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
+use std::ffi::CString;
 
 const METADATA_SIZE: usize = 1024;
 
@@ -25,9 +26,97 @@ struct ClientInfo {
     last_seen: std::time::Instant,
 }
 
+/// A thread-safe wrapper for shared memory
+struct SharedMemory {
+    shmem: Mutex<Shmem>,
+    name: String,
+}
+
+unsafe impl Send for SharedMemory {}
+unsafe impl Sync for SharedMemory {}
+
+impl SharedMemory {
+    /// Create new shared memory
+    fn new(name: &str, size: usize) -> Result<Self> {
+        // Convert name to CString for libc
+        let c_name = CString::new(name.as_bytes()).map_err(|_| {
+            Error::SharedMemoryCreation(shared_memory::ShmemError::MapCreateFailed(0))
+        })?;
+
+        // Try to unlink any existing shared memory
+        unsafe {
+            libc::shm_unlink(c_name.as_ptr());
+        }
+
+        // Create new shared memory with platform-specific configuration
+        let shmem = if cfg!(target_os = "macos") {
+            // On macOS, use anonymous shared memory
+            ShmemConf::new()
+                .size(size)
+                .create()
+                .map_err(Error::SharedMemoryCreation)?
+        } else {
+            ShmemConf::new()
+                .size(size)
+                .os_id(name)
+                .create()
+                .map_err(Error::SharedMemoryCreation)?
+        };
+        
+        Ok(Self {
+            shmem: Mutex::new(shmem),
+            name: name.to_string(),
+        })
+    }
+
+    /// Connect to existing shared memory
+    fn connect(name: &str) -> Result<Self> {
+        // Connect to shared memory with platform-specific configuration
+        let shmem = if cfg!(target_os = "macos") {
+            // On macOS, use anonymous shared memory
+            ShmemConf::new()
+                .size(4096) // Default size for connection
+                .open()
+                .map_err(Error::SharedMemoryCreation)?
+        } else {
+            ShmemConf::new()
+                .os_id(name)
+                .open()
+                .map_err(Error::SharedMemoryCreation)?
+        };
+        
+        Ok(Self {
+            shmem: Mutex::new(shmem),
+            name: name.to_string(),
+        })
+    }
+
+    /// Get a pointer to the shared memory
+    unsafe fn as_ptr(&self) -> *mut u8 {
+        self.shmem.lock().as_ptr()
+    }
+
+    /// Get the size of the shared memory
+    fn len(&self) -> usize {
+        self.shmem.lock().len()
+    }
+}
+
+impl Drop for SharedMemory {
+    fn drop(&mut self) {
+        // Clean up shared memory on drop
+        if let Ok(c_name) = CString::new(self.name.as_bytes()) {
+            unsafe {
+                libc::shm_unlink(c_name.as_ptr());
+            }
+        }
+    }
+}
+
 /// The broker manages the shared memory and client subscriptions
 pub struct Broker {
-    shm: Arc<Shmem>,
+    #[allow(dead_code)]
+    shm: Arc<SharedMemory>,
     ring_buffer: Arc<RingBuffer>,
     subscriptions: Arc<RwLock<HashMap<ClientId, ClientInfo>>>,
     counters: Arc<Counters>,
@@ -38,30 +127,16 @@ impl Broker {
     /// Create a new broker instance
     pub fn new(config: BrokerConfig) -> Result<Self> {
         info!("Creating new broker with config: {:?}", config);
-        
+
         if config.buffer_size == 0 {
             return Err(Error::InvalidConfig("Buffer size cannot be zero".into()));
         }
 
         let total_size = config.buffer_size + METADATA_SIZE;
-        
-        let shm = Arc::new(
-            ShmemConf::new()
-                .size(total_size)
-                .os_id(&config.name)
-                .create()
-                .map_err(Error::SharedMemoryCreation)?,
-        );
 
-        debug!("Created shared memory segment of size {}", total_size);
-
-        let ptr = shm.as_ptr();
-        let ring_buffer = unsafe {
-            Arc::new(RingBuffer::from_raw_parts(
-                ptr as *mut u8,
-                config.buffer_size,
-            )?)
-        };
+        let shm = Arc::new(SharedMemory::new(&config.name, total_size)?);
+        let ptr = unsafe { shm.as_ptr() };
+        let ring_buffer = unsafe { Arc::new(RingBuffer::from_raw_parts(ptr, config.buffer_size)?) };
 
         let subscriptions = Arc::new(RwLock::new(HashMap::new()));
         let counters = Arc::new(Counters {
@@ -81,23 +156,11 @@ impl Broker {
     /// Connect to an existing broker
     pub fn connect(name: &str) -> Result<Self> {
         info!("Connecting to existing broker: {}", name);
-        
-        let shm = Arc::new(
-            ShmemConf::new()
-                .os_id(name)
-                .open()
-                .map_err(Error::SharedMemoryCreation)?,
-        );
 
-        let size = shm.len() - METADATA_SIZE;
-        
-        let ptr = shm.as_ptr();
-        let ring_buffer = unsafe {
-            Arc::new(RingBuffer::from_raw_parts(
-                ptr as *mut u8,
-                size,
-            )?)
-        };
+        let shm = Arc::new(SharedMemory::connect(name)?);
+        let ptr = unsafe { shm.as_ptr() };
+        let size = shm.len();
+        let ring_buffer = unsafe { Arc::new(RingBuffer::from_raw_parts(ptr, size)?) };
 
         let config = BrokerConfig {
             name: name.to_string(),
@@ -124,19 +187,22 @@ impl Broker {
     pub fn register_client(&self, name: &str) -> Result<ClientId> {
         let client_id = ClientId::new();
         let subs = self.subscriptions.read();
-        
+
         if subs.len() >= self.config.max_clients {
             error!("Client limit exceeded: {}", self.config.max_clients);
             return Err(Error::ClientLimitExceeded);
         }
 
         debug!("Registering new client: {} ({})", name, client_id.as_str());
-        
+
         let mut subs = self.subscriptions.write();
-        subs.insert(client_id.clone(), ClientInfo {
-            patterns: Vec::new(),
-            last_seen: std::time::Instant::now(),
-        });
+        subs.insert(
+            client_id.clone(),
+            ClientInfo {
+                patterns: Vec::new(),
+                last_seen: std::time::Instant::now(),
+            },
+        );
 
         Ok(client_id)
     }
@@ -146,7 +212,10 @@ impl Broker {
         info!("Unregistering client: {}", client_id.as_str());
         let mut subs = self.subscriptions.write();
         if subs.remove(client_id).is_none() {
-            warn!("Attempted to unregister non-existent client: {}", client_id.as_str());
+            warn!(
+                "Attempted to unregister non-existent client: {}",
+                client_id.as_str()
+            );
             return Err(Error::ClientNotFound(client_id.as_str()));
         }
         Ok(())
@@ -155,8 +224,9 @@ impl Broker {
     /// Subscribe to a topic pattern
     pub fn subscribe(&self, client_id: &ClientId, pattern: &str) -> Result<()> {
         let mut subs = self.subscriptions.write();
-        
-        let client = subs.get_mut(client_id)
+
+        let client = subs
+            .get_mut(client_id)
             .ok_or_else(|| Error::ClientNotFound(client_id.as_str()))?;
 
         if client.patterns.len() >= self.config.max_subscriptions_per_client {
@@ -168,7 +238,11 @@ impl Broker {
             return Err(Error::SubscriptionLimitExceeded(client_id.as_str()));
         }
 
-        debug!("Client {} subscribing to pattern: {}", client_id.as_str(), pattern);
+        debug!(
+            "Client {} subscribing to pattern: {}",
+            client_id.as_str(),
+            pattern
+        );
         client.patterns.push(TopicMatcher::new(pattern));
         client.last_seen = std::time::Instant::now();
 
@@ -178,11 +252,16 @@ impl Broker {
     /// Unsubscribe from a topic pattern
     pub fn unsubscribe(&self, client_id: &ClientId, pattern: &str) -> Result<()> {
         let mut subs = self.subscriptions.write();
-        
-        let client = subs.get_mut(client_id)
+
+        let client = subs
+            .get_mut(client_id)
             .ok_or_else(|| Error::ClientNotFound(client_id.as_str()))?;
 
-        debug!("Client {} unsubscribing from pattern: {}", client_id.as_str(), pattern);
+        debug!(
+            "Client {} unsubscribing from pattern: {}",
+            client_id.as_str(),
+            pattern
+        );
         let matcher = TopicMatcher::new(pattern);
         client.patterns.retain(|p| p != &matcher);
         client.last_seen = std::time::Instant::now();
@@ -193,36 +272,52 @@ impl Broker {
     /// Publish a message
     pub fn publish(&self, message: Message) -> Result<()> {
         debug!("Publishing message to topic: {}", message.topic.name());
-        
-        let serialized = bincode::serialize(&message)
-            .map_err(|e| Error::SerializationError(e.to_string()))?;
+
+        let serialized =
+            bincode::serialize(&message).map_err(|e| Error::SerializationError(e.to_string()))?;
 
         self.ring_buffer.write(&serialized)?;
-        self.counters.messages_published.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .messages_published
+            .fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
 
     /// Receive a message for a specific client
     pub fn receive(&self, client_id: &ClientId) -> Result<Message> {
-        let mut subs = self.subscriptions.write();
-        let client = subs.get_mut(client_id)
-            .ok_or_else(|| Error::ClientNotFound(client_id.as_str()))?;
+        // First check if client exists and get patterns
+        let patterns = {
+            let subs = self.subscriptions.read();
+            let client = subs
+                .get(client_id)
+                .ok_or_else(|| Error::ClientNotFound(client_id.as_str()))?;
+            client.patterns.clone()
+        };
 
+        // Read message without holding subscription lock
         let mut temp_buf = vec![0u8; self.ring_buffer.size()];
         self.ring_buffer.read(&mut temp_buf)?;
 
         let message: Message = bincode::deserialize(&temp_buf)
             .map_err(|e| Error::DeserializationError(e.to_string()))?;
 
-        if client.patterns.iter().any(|p| p.matches(message.topic.name())) {
+        // Check if message matches any patterns
+        if patterns.iter().any(|p| p.matches(message.topic.name())) {
+            // Update last seen time
+            if let Some(client) = self.subscriptions.write().get_mut(client_id) {
+                client.last_seen = std::time::Instant::now();
+            }
+            
             debug!(
                 "Delivering message on topic {} to client {}",
                 message.topic.name(),
                 client_id.as_str()
             );
-            client.last_seen = std::time::Instant::now();
-            self.counters.messages_delivered.fetch_add(1, Ordering::Relaxed);
+            
+            self.counters
+                .messages_delivered
+                .fetch_add(1, Ordering::Relaxed);
             Ok(message)
         } else {
             Err(Error::BufferEmpty)
@@ -232,9 +327,7 @@ impl Broker {
     /// Get broker statistics
     pub fn stats(&self) -> BrokerStats {
         let subs = self.subscriptions.read();
-        let total_subscriptions = subs.values()
-            .map(|client| client.patterns.len())
-            .sum();
+        let total_subscriptions = subs.values().map(|client| client.patterns.len()).sum();
 
         BrokerStats {
             connected_clients: subs.len(),
@@ -244,4 +337,4 @@ impl Broker {
             buffer_usage: self.ring_buffer.usage(),
         }
     }
-} 
+}

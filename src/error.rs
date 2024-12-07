@@ -4,16 +4,16 @@ use thiserror::Error;
 pub enum Error {
     #[error("Failed to create shared memory segment: {0}")]
     SharedMemoryCreation(#[from] shared_memory::ShmemError),
-    
+
     #[error("Buffer is full")]
     BufferFull,
-    
+
     #[error("Buffer is empty")]
     BufferEmpty,
-    
+
     #[error("Invalid buffer size")]
     InvalidBufferSize,
-    
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -48,4 +48,4 @@ pub enum Error {
     InvalidConfig(String),
 }
 
-pub type Result<T> = std::result::Result<T, Error>; 
+pub type Result<T> = std::result::Result<T, Error>;

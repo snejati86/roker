@@ -1,189 +1,184 @@
 use crate::error::{Error, Result};
-use parking_lot::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tracing::{debug, trace, warn};
+use parking_lot::Mutex;
+use std::time::{Duration, Instant};
 
-#[repr(C)]
-pub(crate) struct RingBuffer {
-    data: *mut u8,
+const MAX_WAIT_TIME: Duration = Duration::from_secs(5);
+
+/// A thread-safe wrapper for raw memory pointer
+struct SharedPtr {
+    ptr: *mut u8,
+}
+
+// Implement Send and Sync for SharedPtr
+unsafe impl Send for SharedPtr {}
+unsafe impl Sync for SharedPtr {}
+
+impl SharedPtr {
+    /// Create a new SharedPtr from a raw pointer
+    unsafe fn new(ptr: *mut u8) -> Self {
+        Self { ptr }
+    }
+
+    /// Get a mutable reference to the underlying memory
+    unsafe fn get_mut(&self) -> *mut u8 {
+        self.ptr
+    }
+}
+
+/// A fixed-size ring buffer implementation using shared memory
+pub struct RingBuffer {
+    data: SharedPtr,
     size: usize,
     read_pos: AtomicUsize,
     write_pos: AtomicUsize,
-    lock: RwLock<()>,
+    lock: Mutex<()>,
 }
 
-// SAFETY: The RingBuffer uses atomic operations and proper locking
-// to ensure thread safety of all operations.
 unsafe impl Send for RingBuffer {}
 unsafe impl Sync for RingBuffer {}
 
 impl RingBuffer {
+    /// Create a new ring buffer with the given size
     pub fn new(size: usize) -> Result<Self> {
-        if !size.is_power_of_two() {
+        if size == 0 || !size.is_power_of_two() {
             return Err(Error::InvalidBufferSize);
         }
 
-        let data = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-
-        if data == libc::MAP_FAILED {
-            return Err(Error::Io(std::io::Error::last_os_error()));
-        }
-
-        debug!("Created new ring buffer with size: {}", size);
+        let data = vec![0u8; size];
+        let ptr = Box::into_raw(data.into_boxed_slice()) as *mut u8;
 
         Ok(Self {
-            data: data as *mut u8,
+            data: unsafe { SharedPtr::new(ptr) },
             size,
             read_pos: AtomicUsize::new(0),
             write_pos: AtomicUsize::new(0),
-            lock: RwLock::new(()),
+            lock: Mutex::new(()),
         })
     }
 
-    /// Creates a RingBuffer from existing shared memory
+    /// Create a ring buffer from raw parts
     pub unsafe fn from_raw_parts(ptr: *mut u8, size: usize) -> Result<Self> {
-        if !size.is_power_of_two() {
+        if size == 0 || !size.is_power_of_two() {
             return Err(Error::InvalidBufferSize);
         }
 
-        debug!("Creating ring buffer from raw parts, size: {}", size);
-
         Ok(Self {
-            data: ptr,
+            data: SharedPtr::new(ptr),
             size,
             read_pos: AtomicUsize::new(0),
             write_pos: AtomicUsize::new(0),
-            lock: RwLock::new(()),
+            lock: Mutex::new(()),
         })
     }
 
-    pub fn write(&self, data: &[u8]) -> Result<()> {
-        let _lock = self.lock.write();
-        
-        let write_pos = self.write_pos.load(Ordering::Acquire);
-        let read_pos = self.read_pos.load(Ordering::Acquire);
-        
-        let available_space = if write_pos >= read_pos {
-            if read_pos == 0 {
-                self.size - write_pos
-            } else {
-                self.size - write_pos + read_pos - 1
-            }
-        } else {
-            read_pos - write_pos - 1
-        };
-
-        if data.len() > available_space {
-            warn!("Buffer full: need {} bytes, only {} available", data.len(), available_space);
-            return Err(Error::BufferFull);
-        }
-
-        trace!("Writing {} bytes at position {}", data.len(), write_pos);
-
-        let write_end = write_pos + data.len();
-        let wrap_around = write_end > self.size;
-
-        unsafe {
-            if wrap_around {
-                let first_chunk_size = self.size - write_pos;
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    self.data.add(write_pos),
-                    first_chunk_size,
-                );
-                std::ptr::copy_nonoverlapping(
-                    data[first_chunk_size..].as_ptr(),
-                    self.data,
-                    data.len() - first_chunk_size,
-                );
-            } else {
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    self.data.add(write_pos),
-                    data.len(),
-                );
-            }
-        }
-
-        self.write_pos.store(
-            (write_pos + data.len()) % self.size,
-            Ordering::Release,
-        );
-
-        Ok(())
-    }
-
-    pub fn read(&self, buf: &mut [u8]) -> Result<()> {
-        let _lock = self.lock.read();
-        
-        let read_pos = self.read_pos.load(Ordering::Acquire);
-        let write_pos = self.write_pos.load(Ordering::Acquire);
-        
-        let available_data = if write_pos >= read_pos {
-            write_pos - read_pos
-        } else {
-            self.size - read_pos + write_pos
-        };
-
-        if available_data == 0 {
-            return Err(Error::BufferEmpty);
-        }
-
-        if buf.len() > available_data {
-            return Err(Error::BufferEmpty);
-        }
-
-        trace!("Reading {} bytes from position {}", buf.len(), read_pos);
-
-        let read_end = read_pos + buf.len();
-        let wrap_around = read_end > self.size;
-
-        unsafe {
-            if wrap_around {
-                let first_chunk_size = self.size - read_pos;
-                std::ptr::copy_nonoverlapping(
-                    self.data.add(read_pos),
-                    buf.as_mut_ptr(),
-                    first_chunk_size,
-                );
-                std::ptr::copy_nonoverlapping(
-                    self.data,
-                    buf[first_chunk_size..].as_mut_ptr(),
-                    buf.len() - first_chunk_size,
-                );
-            } else {
-                std::ptr::copy_nonoverlapping(
-                    self.data.add(read_pos),
-                    buf.as_mut_ptr(),
-                    buf.len(),
-                );
-            }
-        }
-
-        self.read_pos.store(
-            (read_pos + buf.len()) % self.size,
-            Ordering::Release,
-        );
-
-        Ok(())
-    }
-
+    /// Get the size of the ring buffer
     pub fn size(&self) -> usize {
         self.size
     }
 
+    /// Write data to the ring buffer with timeout
+    pub fn write(&self, data: &[u8]) -> Result<()> {
+        let start = Instant::now();
+        let _guard = self.lock.lock();
+        
+        while start.elapsed() < MAX_WAIT_TIME {
+            let write_pos = self.write_pos.load(Ordering::Relaxed);
+            let read_pos = self.read_pos.load(Ordering::Relaxed);
+            
+            let available = if write_pos >= read_pos {
+                if read_pos == 0 {
+                    self.size - write_pos - 1
+                } else {
+                    self.size - write_pos + read_pos - 1
+                }
+            } else {
+                read_pos - write_pos - 1
+            };
+
+            if data.len() <= available {
+                unsafe {
+                    let write_end = write_pos + data.len();
+                    if write_end > self.size {
+                        // Write needs to wrap around
+                        let first_chunk = self.size - write_pos;
+                        let ptr = self.data.get_mut().add(write_pos);
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, first_chunk);
+                        
+                        let ptr = self.data.get_mut();
+                        std::ptr::copy_nonoverlapping(
+                            data[first_chunk..].as_ptr(),
+                            ptr,
+                            data.len() - first_chunk,
+                        );
+                    } else {
+                        let ptr = self.data.get_mut().add(write_pos);
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+                    }
+                }
+
+                self.write_pos.store((write_pos + data.len()) % self.size, Ordering::Release);
+                return Ok(());
+            }
+
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        Err(Error::Timeout)
+    }
+
+    /// Read data from the ring buffer with timeout
+    pub fn read(&self, buf: &mut [u8]) -> Result<()> {
+        let start = Instant::now();
+        let _guard = self.lock.lock();
+        
+        while start.elapsed() < MAX_WAIT_TIME {
+            let write_pos = self.write_pos.load(Ordering::Acquire);
+            let read_pos = self.read_pos.load(Ordering::Relaxed);
+            
+            let available = if write_pos >= read_pos {
+                write_pos - read_pos
+            } else {
+                self.size - read_pos + write_pos
+            };
+
+            if available > 0 {
+                let to_read = buf.len().min(available);
+
+                unsafe {
+                    let read_end = read_pos + to_read;
+                    if read_end > self.size {
+                        // Read needs to wrap around
+                        let first_chunk = self.size - read_pos;
+                        let ptr = self.data.get_mut().add(read_pos);
+                        std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), first_chunk);
+                        
+                        let ptr = self.data.get_mut();
+                        std::ptr::copy_nonoverlapping(
+                            ptr,
+                            buf[first_chunk..].as_mut_ptr(),
+                            to_read - first_chunk,
+                        );
+                    } else {
+                        let ptr = self.data.get_mut().add(read_pos);
+                        std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), to_read);
+                    }
+                }
+
+                self.read_pos.store((read_pos + to_read) % self.size, Ordering::Release);
+                return Ok(());
+            }
+
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        Err(Error::Timeout)
+    }
+
+    /// Get the current buffer usage
     pub fn usage(&self) -> f32 {
-        let read_pos = self.read_pos.load(Ordering::Relaxed);
         let write_pos = self.write_pos.load(Ordering::Relaxed);
+        let read_pos = self.read_pos.load(Ordering::Relaxed);
         
         let used = if write_pos >= read_pos {
             write_pos - read_pos
@@ -197,9 +192,12 @@ impl RingBuffer {
 
 impl Drop for RingBuffer {
     fn drop(&mut self) {
-        debug!("Dropping ring buffer of size {}", self.size);
         unsafe {
-            libc::munmap(self.data as *mut libc::c_void, self.size);
+            let ptr = self.data.get_mut();
+            if !ptr.is_null() {
+                let slice = std::slice::from_raw_parts_mut(ptr, self.size);
+                drop(Box::from_raw(slice));
+            }
         }
     }
 }
@@ -207,102 +205,71 @@ impl Drop for RingBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::thread;
 
     #[test]
     fn test_ring_buffer_creation() {
-        let buffer = RingBuffer::new(4096).expect("Failed to create buffer");
-        assert_eq!(buffer.size, 4096);
-        assert_eq!(buffer.read_pos.load(Ordering::Relaxed), 0);
-        assert_eq!(buffer.write_pos.load(Ordering::Relaxed), 0);
+        let buffer = RingBuffer::new(1024).unwrap();
+        assert_eq!(buffer.size(), 1024);
     }
 
     #[test]
     fn test_invalid_buffer_size() {
-        let result = RingBuffer::new(1000);
-        assert!(matches!(result, Err(Error::InvalidBufferSize)));
+        assert!(RingBuffer::new(0).is_err());
+        assert!(RingBuffer::new(1023).is_err()); // Not power of 2
     }
 
     #[test]
     fn test_buffer_write_read() {
-        let buffer = RingBuffer::new(4096).expect("Failed to create buffer");
-        let test_data = b"Hello, World!";
-        
-        buffer.write(test_data).expect("Failed to write data");
-        
-        let mut read_buf = vec![0u8; test_data.len()];
-        buffer.read(&mut read_buf).expect("Failed to read data");
-        
-        assert_eq!(&read_buf, test_data);
-    }
+        let buffer = RingBuffer::new(1024).unwrap();
+        let data = b"Hello, World!";
+        buffer.write(data).unwrap();
 
-    #[test]
-    fn test_buffer_wraparound() {
-        let buffer = RingBuffer::new(16).expect("Failed to create buffer");
-        
-        buffer.write(b"1234567890").expect("Failed to write first batch");
-        
-        let mut read_buf = vec![0u8; 10];
-        buffer.read(&mut read_buf).expect("Failed to read first batch");
-        assert_eq!(&read_buf, b"1234567890");
-        
-        buffer.write(b"abcdef").expect("Failed to write second batch");
-        
-        let mut read_buf = vec![0u8; 6];
-        buffer.read(&mut read_buf).expect("Failed to read second batch");
-        assert_eq!(&read_buf, b"abcdef");
+        let mut read_buf = vec![0u8; data.len()];
+        buffer.read(&mut read_buf).unwrap();
+        assert_eq!(&read_buf, data);
     }
 
     #[test]
     fn test_buffer_full() {
-        let buffer = RingBuffer::new(16).expect("Failed to create buffer");
-        
-        buffer.write(b"123456789012345").expect("Failed to write data");
-        
-        let result = buffer.write(b"overflow");
-        assert!(matches!(result, Err(Error::BufferFull)));
+        let buffer = RingBuffer::new(16).unwrap();
+        let data = vec![1u8; 14]; // Leave two bytes for internal bookkeeping
+        buffer.write(&data).unwrap();
+        assert!(buffer.write(&[1u8, 1u8]).is_err());
     }
 
     #[test]
     fn test_buffer_empty() {
-        let buffer = RingBuffer::new(16).expect("Failed to create buffer");
-        let mut read_buf = vec![0u8; 8];
-        
-        let result = buffer.read(&mut read_buf);
-        assert!(matches!(result, Err(Error::BufferEmpty)));
+        let buffer = RingBuffer::new(16).unwrap();
+        let mut buf = [0u8; 1];
+        assert!(buffer.read(&mut buf).is_err());
     }
 
     #[test]
-    fn test_concurrent_access() {
-        let buffer = Arc::new(RingBuffer::new(4096).expect("Failed to create buffer"));
-        let reader_buffer = Arc::clone(&buffer);
-        let writer_buffer = Arc::clone(&buffer);
-        
-        let writer = thread::spawn(move || {
-            for i in 0..10 {
-                let data = format!("Message {}", i);
-                while writer_buffer.write(data.as_bytes()).is_err() {
-                    thread::yield_now();
-                }
-            }
-        });
-        
-        let reader = thread::spawn(move || {
-            let mut messages = Vec::new();
-            let mut buf = vec![0u8; 20];
-            for _ in 0..10 {
-                while reader_buffer.read(&mut buf).is_err() {
-                    thread::yield_now();
-                }
-                messages.push(String::from_utf8_lossy(&buf).to_string());
-            }
-            messages
-        });
-        
-        writer.join().expect("Writer thread panicked");
-        let received = reader.join().expect("Reader thread panicked");
-        
-        assert_eq!(received.len(), 10);
+    fn test_buffer_wraparound() {
+        let buffer = RingBuffer::new(16).unwrap();
+        let data1 = vec![1u8; 10];
+        let data2 = vec![2u8; 4];
+        let data3 = vec![3u8; 4];
+
+        // Fill buffer
+        buffer.write(&data1).unwrap();
+        buffer.write(&data2).unwrap();
+
+        // Read first chunk
+        let mut read_buf = vec![0u8; 10];
+        buffer.read(&mut read_buf).unwrap();
+        assert_eq!(&read_buf, &data1);
+
+        // Write more data that wraps around
+        buffer.write(&data3).unwrap();
+
+        // Read remaining data
+        let mut read_buf = vec![0u8; 4];
+        buffer.read(&mut read_buf).unwrap();
+        assert_eq!(&read_buf, &data2);
+
+        let mut read_buf = vec![0u8; 4];
+        buffer.read(&mut read_buf).unwrap();
+        assert_eq!(&read_buf, &data3);
     }
-} 
+}

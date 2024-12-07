@@ -1,4 +1,4 @@
-use shared_memory_broker::Broker;
+use shared_memory_broker::{Broker, BrokerConfig, ClientId, Message, Topic};
 use std::process::Command;
 use std::time::Duration;
 use std::{env, thread};
@@ -8,7 +8,13 @@ const BUFFER_SIZE: usize = 1024 * 1024; // 1MB
 
 #[test]
 fn test_ipc_communication() {
-    let _broker = Broker::new(TEST_SHM_NAME, BUFFER_SIZE).expect("Failed to create broker");
+    let config = BrokerConfig {
+        name: TEST_SHM_NAME.to_string(),
+        buffer_size: BUFFER_SIZE,
+        max_clients: 100,
+        max_subscriptions_per_client: 10,
+    };
+    let _broker = Broker::new(config).expect("Failed to create broker");
     
     // Start publisher process
     let publisher = thread::spawn(|| {
@@ -47,6 +53,7 @@ fn publisher_process() {
     thread::sleep(Duration::from_millis(200));
 
     let broker = Broker::connect(TEST_SHM_NAME).expect("Failed to connect to broker");
+    let _client_id = ClientId::new();
     
     // Publish messages with different topics
     let test_messages = vec![
@@ -56,8 +63,10 @@ fn publisher_process() {
         ("/videos/mp4", "MP4 video data"),
     ];
 
-    for (topic, data) in test_messages {
-        broker.publish(topic, data.as_bytes()).expect("Failed to publish");
+    for (topic_str, data) in test_messages {
+        let topic = Topic::new(topic_str).expect("Invalid topic");
+        let message = Message::new(topic, data.as_bytes().to_vec());
+        broker.publish(message).expect("Failed to publish");
         thread::sleep(Duration::from_millis(100));
     }
 }
@@ -72,20 +81,20 @@ fn subscriber_process() {
     thread::sleep(Duration::from_millis(200));
 
     let broker = Broker::connect(TEST_SHM_NAME).expect("Failed to connect to broker");
+    let client_id = ClientId::new();
     
     // Subscribe to different patterns
-    broker.subscribe("client1", "/images/*").expect("Failed to subscribe");
-    broker.subscribe("client1", "/videos/#").expect("Failed to subscribe");
+    broker.subscribe(&client_id, "/images/*").expect("Failed to subscribe");
+    broker.subscribe(&client_id, "/videos/#").expect("Failed to subscribe");
 
     let mut received_messages = Vec::new();
-    let mut buf = vec![0u8; 1024];
 
     // Try to receive messages for a while
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
-        if let Ok((topic, len)) = broker.receive("client1", &mut buf) {
-            let data = String::from_utf8_lossy(&buf[..len]).to_string();
-            received_messages.push((topic, data));
+        if let Ok(message) = broker.receive(&client_id) {
+            received_messages.push((message.topic.name().to_string(), 
+                                 String::from_utf8_lossy(&message.payload).to_string()));
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -103,4 +112,4 @@ fn subscriber_process() {
     assert!(has_mp4, "Missing MP4 message");
 
     println!("Received messages: {:?}", received_messages);
-} 
+}

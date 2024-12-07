@@ -22,15 +22,15 @@ impl TopicMatcher {
 
     pub fn matches(&self, topic: &str) -> bool {
         let topic_segments: Vec<&str> = topic.split('/').filter(|s| !s.is_empty()).collect();
-        
-        if self.segments.len() != topic_segments.len() && !self.segments.contains(&"#".to_string()) {
+
+        if self.segments.len() != topic_segments.len() && !self.segments.contains(&"#".to_string())
+        {
             return false;
         }
 
         let mut topic_iter = topic_segments.iter();
-        let mut pattern_iter = self.segments.iter();
 
-        while let Some(pattern_segment) = pattern_iter.next() {
+        for pattern_segment in &self.segments {
             match pattern_segment.as_str() {
                 "#" => return true, // Multi-level wildcard
                 "*" => {
@@ -96,4 +96,4 @@ mod tests {
         assert!(!matcher.matches("/images/png"));
         assert!(!matcher.matches("/images/png/width"));
     }
-} 
+}

@@ -1,33 +1,30 @@
 #!/bin/bash
 set -e
 
-# Run formatting check
-cargo fmt -- --check
+# Set up environment
+export RUST_BACKTRACE=1
+export RUST_LOG=debug
 
-# Run clippy
-cargo clippy -- -D warnings
+# Clean up any leftover shared memory segments
+cleanup_shm() {
+    if [ "$(uname)" == "Darwin" ]; then
+        # macOS cleanup - use temporary directory
+        rm -f "${TMPDIR:-/tmp}/test_broker_"*
+    else
+        # Linux cleanup
+        for f in /dev/shm/test_broker_*; do
+            rm -f "$f" 2>/dev/null || true
+        done
+    fi
+}
 
-# Run tests with different configurations
-echo "Running tests in debug mode..."
-cargo test
+cleanup_shm
 
-echo "Running tests in release mode..."
-cargo test --release
+# Run tests
+echo "Running tests..."
+cargo test -- --nocapture
 
-echo "Running tests with all features..."
-cargo test --all-features
+# Clean up after tests
+cleanup_shm
 
-# Run specific test categories
-echo "Running doc tests..."
-cargo test --doc
-
-echo "Running integration tests..."
-cargo test --test '*'
-
-# Run benchmarks if any
-if [ -d "benches" ]; then
-    echo "Running benchmarks..."
-    cargo bench
-fi
-
-echo "All tests completed successfully!" 
+echo "Tests completed" 

@@ -27,6 +27,7 @@ criterion = "0.4"
 tokio-test = "0.4"
 tracing-test = "0.2"
 rand = "0.8"
+lazy_static = "1.4"
 
 [[bench]]
 name = "throughput"
