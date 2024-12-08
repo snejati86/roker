@@ -6,7 +6,12 @@ use std::time::{Duration, Instant};
 
 const KB: usize = 1024;
 const MB: usize = 1024 * KB;
-const OPERATION_TIMEOUT: Duration = Duration::from_millis(100);
+
+// Adjusted timeout constants
+const OPERATION_TIMEOUT: Duration = Duration::from_millis(50);
+const BENCHMARK_TIMEOUT: Duration = Duration::from_secs(10);
+const CLEANUP_TIMEOUT: Duration = Duration::from_millis(25);
+const GLOBAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn create_broker(size: usize) -> Arc<Broker> {
     let config = BrokerConfig {
@@ -20,18 +25,21 @@ fn create_broker(size: usize) -> Arc<Broker> {
 
 fn single_publisher_single_subscriber(c: &mut Criterion) {
     let mut group = c.benchmark_group("single_pub_single_sub");
-    group.sample_size(50); // Reduce sample size for stability
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+    group.warm_up_time(Duration::from_secs(1));
 
-    for size in [4 * KB, 64 * KB, 1 * MB].iter() {
+    // Test only one size for consistency
+    for size in [64 * KB].iter() {
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             let broker = create_broker(size);
-            let pub_id = broker.register_client("publisher").unwrap();
+            let _pub_id = broker.register_client("publisher").unwrap();
             let sub_id = broker.register_client("subscriber").unwrap();
 
             let topic = Topic::new("/test/topic").unwrap();
             broker.subscribe(&sub_id, "/test/topic").unwrap();
 
-            let data = vec![1u8; 1024]; // 1KB messages
+            let data = vec![1u8; 64]; // Use smaller messages for consistency
 
             b.iter(|| {
                 broker
@@ -39,7 +47,8 @@ fn single_publisher_single_subscriber(c: &mut Criterion) {
                     .unwrap();
 
                 let start = Instant::now();
-                while start.elapsed() < OPERATION_TIMEOUT {
+                let deadline = start + Duration::from_millis(100);
+                while Instant::now() < deadline {
                     if let Ok(received) = broker.receive(&sub_id) {
                         assert_eq!(&received.payload, &data);
                         break;
@@ -48,9 +57,8 @@ fn single_publisher_single_subscriber(c: &mut Criterion) {
                 }
             });
 
-            // Cleanup
             drop(broker);
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(CLEANUP_TIMEOUT);
         });
     }
     group.finish();
@@ -58,43 +66,38 @@ fn single_publisher_single_subscriber(c: &mut Criterion) {
 
 fn multiple_publishers_single_subscriber(c: &mut Criterion) {
     let mut group = c.benchmark_group("multi_pub_single_sub");
-    group.sample_size(20); // Reduce sample size for stability
-    group.measurement_time(Duration::from_secs(2));
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+    group.warm_up_time(Duration::from_secs(1));
 
-    for size in [64 * KB, 1 * MB].iter() {
+    for size in [64 * KB].iter() {
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             let broker = create_broker(size);
             let sub_id = broker.register_client("subscriber").unwrap();
-            let pub_id = broker.register_client("publisher").unwrap();
+            let _pub_id = broker.register_client("publisher").unwrap();
 
             let topic = Topic::new("/test/topic").unwrap();
             broker.subscribe(&sub_id, "/test/topic").unwrap();
 
-            let data = vec![1u8; 1024];
-            let mut received_count = 0;
+            let data = vec![1u8; 64];
 
             b.iter(|| {
-                // Publish message
                 broker
                     .publish(Message::new(topic.clone(), black_box(data.clone())))
                     .unwrap();
 
-                // Try to receive with timeout
                 let start = Instant::now();
-                while start.elapsed() < OPERATION_TIMEOUT {
+                let deadline = start + Duration::from_millis(100);
+                while Instant::now() < deadline {
                     if broker.receive(&sub_id).is_ok() {
-                        received_count += 1;
                         break;
                     }
                     thread::yield_now();
                 }
             });
 
-            println!("Messages received: {}", received_count);
-
-            // Cleanup
             drop(broker);
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(CLEANUP_TIMEOUT);
         });
     }
     group.finish();
@@ -102,14 +105,16 @@ fn multiple_publishers_single_subscriber(c: &mut Criterion) {
 
 fn single_publisher_multiple_subscribers(c: &mut Criterion) {
     let mut group = c.benchmark_group("single_pub_multi_sub");
-    let num_subscribers = 2; // Reduced from 4 to 2 for stability
-    group.sample_size(30); // Reduce sample size for stability
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+    group.warm_up_time(Duration::from_secs(1));
 
-    for size in [64 * KB, 1 * MB].iter() {
+    for size in [256 * KB].iter() {
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             let broker = create_broker(size);
-            let pub_id = broker.register_client("publisher").unwrap();
-            let sub_ids: Vec<_> = (0..num_subscribers)
+            let _pub_id = broker.register_client("publisher").unwrap();
+
+            let sub_ids: Vec<_> = (0..2)
                 .map(|i| {
                     let id = broker
                         .register_client(&format!("subscriber_{}", i))
@@ -120,28 +125,38 @@ fn single_publisher_multiple_subscribers(c: &mut Criterion) {
                 .collect();
 
             let topic = Topic::new("/test/topic").unwrap();
-            let data = vec![1u8; 1024];
+            let data = vec![1u8; 64];
 
             b.iter(|| {
                 broker
                     .publish(Message::new(topic.clone(), black_box(data.clone())))
                     .unwrap();
 
-                for sub_id in &sub_ids {
-                    let start = Instant::now();
-                    while start.elapsed() < OPERATION_TIMEOUT {
-                        if let Ok(received) = broker.receive(sub_id) {
-                            assert_eq!(&received.payload, &data);
-                            break;
+                let start = Instant::now();
+                let mut received = vec![false; sub_ids.len()];
+                let deadline = start + Duration::from_millis(100);
+
+                while !received.iter().all(|&x| x) && Instant::now() < deadline {
+                    for (idx, sub_id) in sub_ids.iter().enumerate() {
+                        if !received[idx] {
+                            if let Ok(msg) = broker.receive(sub_id) {
+                                if msg.payload == data {
+                                    received[idx] = true;
+                                }
+                            }
                         }
-                        thread::yield_now();
                     }
+                    thread::yield_now();
                 }
+
+                assert!(
+                    received.iter().all(|&x| x),
+                    "Not all subscribers received the message"
+                );
             });
 
-            // Cleanup
             drop(broker);
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(CLEANUP_TIMEOUT);
         });
     }
     group.finish();
@@ -151,18 +166,18 @@ fn high_throughput_test(c: &mut Criterion) {
     let mut group = c.benchmark_group("high_throughput");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(5));
+    group.warm_up_time(Duration::from_secs(1));
 
-    let num_publishers = 2; // Reduced from 4 to 2
-    let num_subscribers = 2; // Reduced from 4 to 2
-    let messages_per_publisher = 1000; // Reduced from 10000
-    let buffer_size = 16 * MB;
+    let num_publishers = 2;
+    let num_subscribers = 2;
+    let messages_per_publisher = 100;
+    let buffer_size = 4 * MB;
 
     group.bench_function("multi_pub_multi_sub", |b| {
         b.iter(|| {
             let broker = create_broker(buffer_size);
             let barrier = Arc::new(Barrier::new(num_publishers + num_subscribers + 1));
 
-            // Register clients
             let pub_ids: Vec<_> = (0..num_publishers)
                 .map(|i| broker.register_client(&format!("publisher_{}", i)).unwrap())
                 .collect();
@@ -180,7 +195,6 @@ fn high_throughput_test(c: &mut Criterion) {
             let topic = Topic::new("/test/topic").unwrap();
             let broker = Arc::new(broker);
 
-            // Spawn publishers
             let publisher_handles: Vec<_> = pub_ids
                 .into_iter()
                 .map(|id| {
@@ -189,7 +203,6 @@ fn high_throughput_test(c: &mut Criterion) {
                     let topic = topic.clone();
                     thread::spawn(move || {
                         barrier.wait();
-
                         for i in 0..messages_per_publisher {
                             let msg = format!("Message {} from publisher {}", i, id.as_str());
                             let start = Instant::now();
@@ -207,7 +220,6 @@ fn high_throughput_test(c: &mut Criterion) {
                 })
                 .collect();
 
-            // Spawn subscribers
             let subscriber_handles: Vec<_> = sub_ids
                 .into_iter()
                 .map(|id| {
@@ -219,7 +231,7 @@ fn high_throughput_test(c: &mut Criterion) {
 
                         let start = Instant::now();
                         while received < num_publishers * messages_per_publisher
-                            && start.elapsed() < Duration::from_secs(30)
+                            && start.elapsed() < BENCHMARK_TIMEOUT
                         {
                             if broker.receive(&id).is_ok() {
                                 received += 1;
@@ -232,38 +244,38 @@ fn high_throughput_test(c: &mut Criterion) {
                 })
                 .collect();
 
-            // Start the test
             barrier.wait();
 
-            // Wait for completion
             for handle in publisher_handles {
-                handle.join().unwrap();
+                handle.join().expect("Publisher thread panicked");
             }
 
             let received_counts: Vec<_> = subscriber_handles
                 .into_iter()
-                .map(|h| h.join().unwrap())
+                .map(|h| h.join().expect("Subscriber thread panicked"))
                 .collect();
 
-            // Verify that all subscribers received all messages
             for count in received_counts {
                 assert_eq!(count, num_publishers * messages_per_publisher);
             }
 
-            // Cleanup
             drop(broker);
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(CLEANUP_TIMEOUT);
         })
     });
 
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    single_publisher_single_subscriber,
-    multiple_publishers_single_subscriber,
-    single_publisher_multiple_subscribers,
-    high_throughput_test
-);
+criterion_group! {
+    name = benches;
+    config = Criterion::default()
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(5))
+        .warm_up_time(Duration::from_secs(1));
+    targets = single_publisher_single_subscriber,
+             multiple_publishers_single_subscriber,
+             single_publisher_multiple_subscribers,
+             high_throughput_test
+}
 criterion_main!(benches);

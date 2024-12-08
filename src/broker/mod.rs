@@ -24,6 +24,7 @@ struct Counters {
 struct ClientInfo {
     patterns: Vec<TopicMatcher>,
     last_seen: std::time::Instant,
+    read_position: usize, // Track read position per client
 }
 
 /// A thread-safe wrapper for shared memory
@@ -200,7 +201,6 @@ impl Broker {
     pub fn register_client(&self, name: &str) -> Result<ClientId> {
         let client_id = ClientId::new();
 
-        // Acquire write lock directly
         let mut subs = self.subscriptions.write();
 
         if subs.len() >= self.config.max_clients {
@@ -215,6 +215,7 @@ impl Broker {
             ClientInfo {
                 patterns: Vec::new(),
                 last_seen: std::time::Instant::now(),
+                read_position: self.ring_buffer.write_pos(), // Start at current write position
             },
         );
 
@@ -300,31 +301,31 @@ impl Broker {
 
     /// Receive a message for a specific client
     pub fn receive(&self, client_id: &ClientId) -> Result<Message> {
-        // First check if client exists and get patterns
-        let patterns = {
+        // Get client info and patterns
+        let (patterns, read_pos) = {
             let subs = self.subscriptions.read();
             let client = subs
                 .get(client_id)
                 .ok_or_else(|| Error::ClientNotFound(client_id.as_str()))?;
-            client.patterns.clone()
+            (client.patterns.clone(), client.read_position)
         };
 
-        // Read message without holding subscription lock
-        let mut temp_buf = vec![0u8; self.ring_buffer.size()];
-        self.ring_buffer.read(&mut temp_buf)?;
+        // Read message from client's position
+        let (data, new_pos) = self.ring_buffer.read_message(read_pos)?;
 
-        let message: Message = bincode::deserialize(&temp_buf)
-            .map_err(|e| Error::DeserializationError(e.to_string()))?;
+        let message: Message =
+            bincode::deserialize(&data).map_err(|e| Error::DeserializationError(e.to_string()))?;
 
         // Check if message matches any patterns
         if patterns.iter().any(|p| p.matches(message.topic.name())) {
-            // Update last seen time
+            // Update client's read position
             if let Some(client) = self.subscriptions.write().get_mut(client_id) {
+                client.read_position = new_pos;
                 client.last_seen = std::time::Instant::now();
             }
 
             debug!(
-                "Delivering message on topic {} to client {}",
+                "Delivered message on topic {} to client {}",
                 message.topic.name(),
                 client_id.as_str()
             );
@@ -334,6 +335,10 @@ impl Broker {
                 .fetch_add(1, Ordering::Relaxed);
             Ok(message)
         } else {
+            // If message doesn't match, advance read position anyway
+            if let Some(client) = self.subscriptions.write().get_mut(client_id) {
+                client.read_position = new_pos;
+            }
             Err(Error::BufferEmpty)
         }
     }

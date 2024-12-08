@@ -46,6 +46,9 @@ pub enum Error {
 
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
+
+    #[error("Buffer too small")]
+    BufferTooSmall,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use std::{env, thread};
 
 const TEST_SHM_NAME: &str = "test_broker";
-const BUFFER_SIZE: usize = 1024 * 1024; // 1MB
+const BUFFER_SIZE: usize = 1024 * 1024; // 1MB (2^20)
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Helper struct to manage test processes
@@ -122,7 +122,9 @@ fn publisher_process() {
         }
     };
 
-    let _client_id = ClientId::new();
+    let client_id = broker
+        .register_client("publisher")
+        .expect("Failed to register publisher");
 
     // Publish messages with different topics
     let test_messages = vec![
@@ -135,8 +137,23 @@ fn publisher_process() {
     for (topic_str, data) in test_messages {
         let topic = Topic::new(topic_str).expect("Invalid topic");
         let message = Message::new(topic, data.as_bytes().to_vec());
-        if let Err(e) = broker.publish(message) {
-            println!("Failed to publish message: {}", e);
+
+        // Try to publish with retries
+        let mut success = false;
+        for _ in 0..10 {
+            match broker.publish(message.clone()) {
+                Ok(_) => {
+                    success = true;
+                    break;
+                }
+                Err(e) => {
+                    println!("Failed to publish message, retrying: {}", e);
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        if !success {
+            println!("Failed to publish message after retries");
             return;
         }
         thread::sleep(Duration::from_millis(50));
@@ -160,7 +177,9 @@ fn subscriber_process() {
         }
     };
 
-    let client_id = ClientId::new();
+    let client_id = broker
+        .register_client("subscriber")
+        .expect("Failed to register subscriber");
 
     // Subscribe to different patterns
     if let Err(e) = broker.subscribe(&client_id, "/images/*") {
@@ -186,9 +205,9 @@ fn subscriber_process() {
             }
             Err(e) => {
                 println!("Error receiving message: {}", e);
+                thread::sleep(Duration::from_millis(50));
             }
         }
-        thread::sleep(Duration::from_millis(50));
     }
 
     // Verify received messages
