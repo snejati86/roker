@@ -42,7 +42,6 @@ unsafe impl Send for RingBuffer {}
 unsafe impl Sync for RingBuffer {}
 
 impl RingBuffer {
-    #[allow(dead_code)]
     /// Create a new ring buffer with the given size
     pub fn new(size: usize) -> Result<Self> {
         if size == 0 || !size.is_power_of_two() {
@@ -87,17 +86,6 @@ impl RingBuffer {
             lock: Mutex::new(()),
             owns_data: owns_memory,
         })
-    }
-
-    /// Get the size of the ring buffer
-    pub fn size(&self) -> usize {
-        self.size
-    }
-
-    /// Reset the ring buffer positions
-    pub fn reset(&self) {
-        self.write_pos.store(0, Ordering::Release);
-        self.read_pos.store(0, Ordering::Release);
     }
 
     /// Write data to the ring buffer with timeout
@@ -445,59 +433,14 @@ impl RingBuffer {
     pub fn write_pos(&self) -> usize {
         self.write_pos.load(Ordering::Acquire)
     }
-
-    /// Read data from a specific position in the ring buffer
-    pub fn read_from(&self, buf: &mut [u8], read_pos: usize) -> Result<usize> {
-        let _guard = self.lock.lock();
-        let write_pos = self.write_pos.load(Ordering::Acquire);
-
-        // Calculate available data from the given position
-        let available = if write_pos >= read_pos {
-            write_pos - read_pos
-        } else {
-            self.size - read_pos + write_pos
-        };
-
-        if available == 0 {
-            return Ok(0);
-        }
-
-        let to_read = buf.len().min(available);
-
-        unsafe {
-            let read_end = read_pos + to_read;
-            if read_end > self.size {
-                // Read needs to wrap around
-                let first_chunk = self.size - read_pos;
-                let ptr = self.data.get_mut().add(read_pos);
-                std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), first_chunk);
-
-                let ptr = self.data.get_mut();
-                std::ptr::copy_nonoverlapping(
-                    ptr,
-                    buf[first_chunk..].as_mut_ptr(),
-                    to_read - first_chunk,
-                );
-            } else {
-                let ptr = self.data.get_mut().add(read_pos);
-                std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), to_read);
-            }
-        }
-
-        Ok(to_read)
-    }
 }
 
 impl Drop for RingBuffer {
     fn drop(&mut self) {
         if self.owns_data {
             unsafe {
-                let ptr = self.data.get_mut();
-                if !ptr.is_null() {
-                    // Reconstruct the original Box<[u8]> using a pointer to the slice
-                    let slice_ptr = std::ptr::slice_from_raw_parts_mut(ptr, self.size);
-                    drop(Box::from_raw(slice_ptr));
-                }
+                let slice = std::slice::from_raw_parts_mut(self.data.get_mut(), self.size);
+                Box::from_raw(slice as *mut [u8]);
             }
         }
     }
