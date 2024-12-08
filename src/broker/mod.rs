@@ -215,7 +215,7 @@ impl Broker {
             ClientInfo {
                 patterns: Vec::new(),
                 last_seen: std::time::Instant::now(),
-                read_position: self.ring_buffer.write_pos(), // Start at current write position
+                read_position: self.ring_buffer.oldest_read_pos(), // Start at current write position
             },
         );
 
@@ -366,9 +366,7 @@ impl Broker {
 
     /// Get the current read position (for debugging)
     pub fn debug_read_pos(&self) -> usize {
-        self.ring_buffer
-            .read_pos
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.ring_buffer.oldest_read_pos()
     }
 
     /// Get the buffer size (for debugging)

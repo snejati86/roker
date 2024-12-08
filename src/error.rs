@@ -49,6 +49,9 @@ pub enum Error {
 
     #[error("Buffer too small")]
     BufferTooSmall,
+
+    #[error("Data overwritten")]
+    DataOverwritten,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
