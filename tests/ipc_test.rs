@@ -1,4 +1,4 @@
-use shared_memory_broker::{Broker, BrokerConfig, ClientId, Message, Topic};
+use roker::{Broker, BrokerConfig, ClientId, Message, Topic};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

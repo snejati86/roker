@@ -1,6 +1,6 @@
-# Contributing to Shared Memory Broker
+# Contributing to Roker
 
-Thank you for your interest in contributing to Shared Memory Broker! This document provides guidelines and instructions for contributing.
+Thank you for your interest in contributing to Roker! This document provides guidelines and instructions for contributing.
 
 ## Code of Conduct
 
@@ -9,7 +9,7 @@ This project adheres to the Rust Code of Conduct. By participating, you are expe
 ## Getting Started
 
 1. Fork the repository
-2. Clone your fork: `git clone https://github.com/your-username/shared-memory-broker.git`
+2. Clone your fork: `git clone https://github.com/your-username/roker.git`
 3. Create a branch: `git checkout -b your-feature-name`
 4. Make your changes
 5. Run tests: `cargo test`

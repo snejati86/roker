@@ -32,7 +32,7 @@ pub struct BrokerConfig {
 impl Default for BrokerConfig {
     fn default() -> Self {
         Self {
-            name: "shared_memory_broker".to_string(),
+            name: "roker".to_string(),
             buffer_size: 64 * 1024 * 1024, // 64MB
             max_clients: 1000,
             max_subscriptions_per_client: 100,

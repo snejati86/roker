@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2024-01-20
 
 ### Added
-- Initial release
+- Initial release of Roker
 - Core broker implementation with shared memory support
 - Topic-based publish/subscribe pattern with wildcard support
 - Thread-safe and process-safe implementation
@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive error handling and logging
 - Zero-copy message passing where possible
 - Async support with Tokio
-- Basic examples and documentation
+- Example applications:
+  - Image broadcasting between processes
+  - Temperature telemetry system
 - Comprehensive test suite
 - Performance benchmarks
 

@@ -1,9 +1,9 @@
-# Shared Memory Broker
+# Roker
 
-A high-performance shared memory broker for pub/sub communication in Rust. This library provides a fast and efficient way to implement inter-process communication using a publish/subscribe pattern with shared memory.
+A high-performance shared memory message broker written in Rust. Roker (Rust + Broker) provides a fast and efficient way to implement inter-process communication using a publish/subscribe pattern with shared memory.
 
-[![Crates.io](https://img.shields.io/crates/v/shared-memory-broker.svg)](https://crates.io/crates/shared-memory-broker)
-[![Documentation](https://docs.rs/shared-memory-broker/badge.svg)](https://docs.rs/shared-memory-broker)
+[![Crates.io](https://img.shields.io/crates/v/roker.svg)](https://crates.io/crates/roker)
+[![Documentation](https://docs.rs/roker/badge.svg)](https://docs.rs/roker)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
 ## Features
@@ -22,34 +22,33 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-shared-memory-broker = "0.1.0"
+roker = "0.1.0"
 ```
 
 ## Quick Start
 
 ```rust
-use shared_memory_broker::{Broker, BrokerConfig, Publisher, Subscriber, Topic};
+use roker::{Broker, BrokerConfig, Message, Topic};
 use std::sync::Arc;
 
 // Create a broker with default configuration
 let config = BrokerConfig::default();
 let broker = Arc::new(Broker::new(config).expect("Failed to create broker"));
 
-// Create a publisher
-let publisher = Publisher::new(Arc::clone(&broker));
-
-// Create a subscriber
-let subscriber = Subscriber::new(Arc::clone(&broker));
+// Register clients
+let publisher_id = broker.register_client("publisher").expect("Failed to register publisher");
+let subscriber_id = broker.register_client("subscriber").expect("Failed to register subscriber");
 
 // Subscribe to a topic
-subscriber.subscribe("/sensors/#").expect("Failed to subscribe");
+broker.subscribe(&subscriber_id, "/sensors/#").expect("Failed to subscribe");
 
 // Publish a message
 let topic = Topic::new("/sensors/temperature").expect("Invalid topic");
-publisher.publish(&topic, b"25.5").expect("Failed to publish");
+let message = Message::new(topic, b"25.5".to_vec());
+broker.publish(message).expect("Failed to publish");
 
 // Receive messages
-if let Ok(message) = subscriber.receive() {
+if let Ok(message) = broker.receive(&subscriber_id) {
     println!("Received: {:?}", message);
 }
 ```
@@ -90,7 +89,7 @@ The broker supports wildcard patterns in topic subscriptions:
 The library uses the `thiserror` crate for comprehensive error handling:
 
 ```rust
-use shared_memory_broker::Error;
+use roker::Error;
 
 match broker.publish(message) {
     Ok(_) => println!("Message published"),
@@ -103,9 +102,9 @@ match broker.publish(message) {
 
 Check the [examples](examples/) directory for more detailed usage examples:
 
-- Basic usage
-- Multiple publishers/subscribers
-- Topic patterns
+- Image broadcasting between processes
+- Temperature telemetry system
+- Topic patterns and wildcards
 - Error handling
 - Performance benchmarks
 

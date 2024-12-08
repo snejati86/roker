@@ -1,4 +1,4 @@
-use shared_memory_broker::{Broker, BrokerConfig, Message, Topic};
+use roker::{Broker, BrokerConfig, Message, Topic};
 use std::thread;
 use std::time::{Duration, Instant};
 
