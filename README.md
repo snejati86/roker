@@ -28,44 +28,57 @@ roker = "0.1.0"
 ## Quick Start
 
 ```rust
-use roker::{Broker, BrokerConfig, Message, Topic};
-use std::sync::Arc;
+use roker::{Publisher, Subscriber, Topic, Message};
 
-// Create a broker with default configuration
-let config = BrokerConfig::default();
-let broker = Arc::new(Broker::new(config).expect("Failed to create broker"));
+// Process 1: Create a publisher
+let publisher = Publisher::connect("my_broker").expect("Failed to connect publisher");
 
-// Register clients
-let publisher_id = broker.register_client("publisher").expect("Failed to register publisher");
-let subscriber_id = broker.register_client("subscriber").expect("Failed to register subscriber");
+// Process 2: Create a subscriber
+let subscriber = Subscriber::connect("my_broker").expect("Failed to connect subscriber");
 
-// Subscribe to a topic
-broker.subscribe(&subscriber_id, "/sensors/#").expect("Failed to subscribe");
+// Subscribe to a topic pattern
+subscriber.subscribe("/sensors/#").expect("Failed to subscribe");
 
 // Publish a message
 let topic = Topic::new("/sensors/temperature").expect("Invalid topic");
 let message = Message::new(topic, b"25.5".to_vec());
-broker.publish(message).expect("Failed to publish");
+publisher.publish(&topic, b"25.5").expect("Failed to publish");
 
 // Receive messages
-if let Ok(message) = broker.receive(&subscriber_id) {
+if let Ok(message) = subscriber.receive() {
     println!("Received: {:?}", message);
 }
 ```
 
-## Performance
+## High-Level APIs
 
-The broker is designed for high-performance scenarios:
+### Publisher API
+```rust
+// Create a publisher
+let publisher = Publisher::connect("my_broker")?;
 
-- Message throughput: Up to 1M messages/second (depending on message size and hardware)
-- Latency: Sub-microsecond in optimal conditions
-- Memory efficient: Zero-copy message passing where possible
-- Scalable: Supports thousands of concurrent clients
+// Publish single message
+publisher.publish(&topic, data)?;
 
-## Configuration
+// Publish multiple messages
+publisher.publish_batch(&[(&topic1, data1), (&topic2, data2)])?;
+```
 
-The broker can be configured through the `BrokerConfig` struct:
+### Subscriber API
+```rust
+// Create a subscriber
+let subscriber = Subscriber::connect("my_broker")?;
 
+// Subscribe to topics (supports wildcards)
+subscriber.subscribe("/sensors/#")?;
+subscriber.unsubscribe("/sensors/temperature")?;
+
+// Receive messages
+let message = subscriber.receive()?;
+let messages = subscriber.receive_batch(10)?;
+```
+
+### Configuration
 ```rust
 let config = BrokerConfig {
     name: "my_broker".to_string(),
@@ -84,6 +97,15 @@ The broker supports wildcard patterns in topic subscriptions:
 - Example: `/sensors/*/temperature` matches `/sensors/room1/temperature`
 - Example: `/sensors/#` matches all topics under `/sensors/`
 
+## Performance
+
+The broker is designed for high-performance scenarios:
+
+- Message throughput: Up to 1M messages/second (depending on message size and hardware)
+- Latency: Sub-microsecond in optimal conditions
+- Memory efficient: Zero-copy message passing where possible
+- Scalable: Supports thousands of concurrent clients
+
 ## Error Handling
 
 The library uses the `thiserror` crate for comprehensive error handling:
@@ -91,12 +113,18 @@ The library uses the `thiserror` crate for comprehensive error handling:
 ```rust
 use roker::Error;
 
-match broker.publish(message) {
+match publisher.publish(&topic, data) {
     Ok(_) => println!("Message published"),
     Err(Error::BufferFull) => println!("Buffer is full"),
     Err(e) => eprintln!("Error: {}", e),
 }
 ```
+
+## Documentation
+
+- [API Documentation](https://snejati86.github.io/roker)
+- [Examples](examples/)
+- [Contributing Guide](CONTRIBUTING.md)
 
 ## Examples
 
