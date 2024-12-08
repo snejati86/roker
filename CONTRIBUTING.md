@@ -9,7 +9,7 @@ This project adheres to the Rust Code of Conduct. By participating, you are expe
 ## Getting Started
 
 1. Fork the repository
-2. Clone your fork: `git clone https://github.com/your-username/roker.git`
+2. Clone your fork: `git clone https://github.com/snejati86/roker.git`
 3. Create a branch: `git checkout -b your-feature-name`
 4. Make your changes
 5. Run tests: `cargo test`
