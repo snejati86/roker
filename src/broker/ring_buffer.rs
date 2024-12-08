@@ -40,6 +40,7 @@ unsafe impl Send for RingBuffer {}
 unsafe impl Sync for RingBuffer {}
 
 impl RingBuffer {
+    #[allow(dead_code)]
     /// Create a new ring buffer with the given size
     pub fn new(size: usize) -> Result<Self> {
         if size == 0 || !size.is_power_of_two() {

@@ -2,7 +2,7 @@ mod ring_buffer;
 
 use crate::error::{Error, Result};
 use crate::topic::TopicMatcher;
-use crate::{BrokerConfig, BrokerStats, ClientId, Message, Topic};
+use crate::{BrokerConfig, BrokerStats, ClientId, Message};
 use parking_lot::{Mutex, RwLock};
 use ring_buffer::RingBuffer;
 use shared_memory::{Shmem, ShmemConf};
