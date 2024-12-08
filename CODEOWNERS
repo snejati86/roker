@@ -1,0 +1,12 @@
+# These owners will be the default owners for everything in
+# the repo. Unless a later match takes precedence,
+# @snejati86 will be requested for review when someone 
+# opens a pull request.
+*       @snejati86
+
+# Specific ownership for core components
+/src/broker/      @snejati86
+/src/client/      @snejati86
+/src/error.rs     @snejati86
+/tests/           @snejati86
+/benches/         @snejati86 
