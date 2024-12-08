@@ -203,6 +203,10 @@ fn subscriber_process() {
                     String::from_utf8_lossy(&message.payload).to_string(),
                 ));
             }
+            Err(roker::Error::BufferEmpty) => {
+                // Buffer is empty, just wait quietly
+                thread::sleep(Duration::from_millis(100));
+            }
             Err(e) => {
                 println!("Error receiving message: {}", e);
                 thread::sleep(Duration::from_millis(50));

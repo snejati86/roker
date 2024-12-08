@@ -1,264 +1,190 @@
 use crate::error::{Error, Result};
 use parking_lot::Mutex;
 use std::mem::size_of;
+use std::ptr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-const MAX_WAIT_TIME: Duration = Duration::from_secs(5);
+use tracing::{debug, error, info};
 
 /// A thread-safe wrapper for raw memory pointer
-struct SharedPtr {
+pub(crate) struct SharedPtr {
     ptr: *mut u8,
 }
 
-// Implement Send and Sync for SharedPtr
 unsafe impl Send for SharedPtr {}
 unsafe impl Sync for SharedPtr {}
 
 impl SharedPtr {
     /// Create a new SharedPtr from a raw pointer
-    unsafe fn new(ptr: *mut u8) -> Self {
+    pub(crate) unsafe fn new(ptr: *mut u8) -> Self {
         Self { ptr }
     }
 
-    /// Get a mutable reference to the underlying memory
-    pub fn get_mut(&self) -> *mut u8 {
-        self.ptr
-    }
-
-    pub fn get(&self) -> *const u8 {
+    /// Get the raw pointer
+    pub(crate) unsafe fn as_ptr(&self) -> *mut u8 {
         self.ptr
     }
 }
 
-/// Represents a subscriber with its own read position and last sequence number
-pub struct Subscriber {
-    pub read_pos: usize,
-    last_seq: u64,
-}
-
-impl Subscriber {
-    fn new(initial_pos: usize) -> Self {
-        Self {
-            read_pos: initial_pos,
-            last_seq: 0,
-        }
-    }
-
-    /// Read data from the ring buffer
-    pub fn read(&mut self, ring_buffer: &RingBuffer) -> Result<Vec<u8>> {
-        ring_buffer.read(&mut self.read_pos, &mut self.last_seq)
-    }
-}
-
-/// A fixed-size ring buffer implementation using shared memory
-pub struct RingBuffer {
-    data: SharedPtr,
-    pub size: usize,
+#[repr(C)]
+struct RingBufferMetadata {
     write_pos: AtomicUsize,
     sequence: AtomicU64,
-    lock: Mutex<()>,
-    subscribers: Mutex<Vec<Arc<Mutex<Subscriber>>>>,
-    owns_data: bool,
+    magic: u64,
+    version: u32,
+    _padding: [u8; 496],
 }
 
-unsafe impl Send for RingBuffer {}
-unsafe impl Sync for RingBuffer {}
+const METADATA_MAGIC: u64 = 0x524F4B45525F4D44; // "ROKER_MD" in hex
+const METADATA_VERSION: u32 = 1;
+
+pub struct RingBuffer {
+    metadata: &'static RingBufferMetadata,
+    data: SharedPtr,
+    size: usize,
+    lock: Mutex<()>,
+}
 
 impl RingBuffer {
-    #[cfg(test)]
-    /// Create a new ring buffer with the given size
-    pub fn new(size: usize) -> Result<Self> {
-        if size == 0 || !size.is_power_of_two() {
-            return Err(Error::InvalidBufferSize);
+    pub unsafe fn from_raw_parts(ptr: *mut u8, size: usize, initialize: bool) -> Result<Self> {
+        let metadata_ptr = ptr as *mut RingBufferMetadata;
+
+        if initialize {
+            debug!(
+                "Initializing new ring buffer metadata: size={}, magic=0x{:X}, version={}",
+                size, METADATA_MAGIC, METADATA_VERSION
+            );
+
+            ptr::write(
+                metadata_ptr,
+                RingBufferMetadata {
+                    write_pos: AtomicUsize::new(0),
+                    sequence: AtomicU64::new(0),
+                    magic: METADATA_MAGIC,
+                    version: METADATA_VERSION,
+                    _padding: [0; 496],
+                },
+            );
+        } else {
+            let metadata = &*metadata_ptr;
+            debug!(
+                "Reading existing ring buffer metadata:\n  \
+                 Magic: 0x{:X} (expected: 0x{:X})\n  \
+                 Version: {} (expected: {})\n  \
+                 Write Position: {}\n  \
+                 Sequence Number: {}",
+                metadata.magic,
+                METADATA_MAGIC,
+                metadata.version,
+                METADATA_VERSION,
+                metadata.write_pos.load(Ordering::Relaxed),
+                metadata.sequence.load(Ordering::Relaxed)
+            );
+
+            if metadata.magic != METADATA_MAGIC {
+                error!("Invalid metadata magic number: 0x{:X}", metadata.magic);
+                return Err(Error::InvalidConfig("Invalid metadata magic number".into()));
+            }
+            if metadata.version != METADATA_VERSION {
+                error!(
+                    "Incompatible metadata version: {} (expected {})",
+                    metadata.version, METADATA_VERSION
+                );
+                return Err(Error::InvalidConfig("Incompatible metadata version".into()));
+            }
         }
 
-        let data = vec![0u8; size];
-        let ptr = Box::into_raw(data.into_boxed_slice()) as *mut u8;
+        let data_ptr = ptr.add(size_of::<RingBufferMetadata>());
+        debug!(
+            "Ring buffer layout:\n  \
+             Metadata size: {} bytes\n  \
+             Data offset: {} bytes\n  \
+             Data size: {} bytes",
+            size_of::<RingBufferMetadata>(),
+            size_of::<RingBufferMetadata>(),
+            size
+        );
 
         Ok(Self {
-            data: unsafe { SharedPtr::new(ptr) },
+            metadata: &*metadata_ptr,
+            data: SharedPtr::new(data_ptr),
             size,
-            write_pos: AtomicUsize::new(0),
-            sequence: AtomicU64::new(0),
             lock: Mutex::new(()),
-            subscribers: Mutex::new(Vec::new()),
-            owns_data: true,
         })
     }
 
-    /// Create a ring buffer from raw parts
-    ///
-    /// # Arguments
-    /// * `ptr` - Pointer to the buffer memory
-    /// * `size` - Size of the buffer (must be power of 2)
-    /// * `owns_memory` - Whether this RingBuffer should take ownership of the memory
-    ///
-    /// # Safety
-    /// - The caller must ensure the pointer is valid and properly aligned
-    /// - If `owns_memory` is true, the memory must have been allocated with the same
-    ///   allocator that Rust's global allocator would use
-    /// - The caller must ensure the memory won't be freed while this RingBuffer exists
-    pub unsafe fn from_raw_parts(ptr: *mut u8, size: usize, owns_memory: bool) -> Result<Self> {
-        if size == 0 || !size.is_power_of_two() {
-            return Err(Error::InvalidBufferSize);
-        }
-
-        Ok(Self {
-            data: SharedPtr::new(ptr),
-            size,
-            write_pos: AtomicUsize::new(0),
-            sequence: AtomicU64::new(0),
-            lock: Mutex::new(()),
-            subscribers: Mutex::new(Vec::new()),
-            owns_data: owns_memory,
-        })
-    }
-
-    /// Register a new subscriber and return it
-    pub fn add_subscriber(&self) -> Arc<Mutex<Subscriber>> {
-        let subscriber = Arc::new(Mutex::new(Subscriber::new(
-            self.write_pos.load(Ordering::Acquire),
-        )));
-        let mut subscribers = self.subscribers.lock();
-        subscribers.push(Arc::clone(&subscriber));
-        subscriber
-    }
-
-    /// Write data to the ring buffer
     pub fn write(&self, data: &[u8]) -> Result<()> {
-        let _total_size = size_of::<u64>() + size_of::<u32>() + data.len();
-        let mut _guard = self.lock.lock();
+        let _guard = self.lock.lock();
 
-        let write_pos = self.write_pos.load(Ordering::Relaxed);
+        let write_pos = self.metadata.write_pos.load(Ordering::Relaxed);
+        let sequence = self.metadata.sequence.fetch_add(1, Ordering::Relaxed);
 
-        // The buffer might overwrite old data if not enough space is available
         let mut current_pos = write_pos;
 
+        // Write sequence number
+        let seq_bytes = sequence.to_le_bytes();
         unsafe {
-            // Write sequence number
-            let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
-            let seq_bytes = seq.to_le_bytes();
             self.write_bytes(&seq_bytes, &mut current_pos)?;
-
-            // Write length prefix
-            let length_bytes = (data.len() as u32).to_le_bytes();
-            self.write_bytes(&length_bytes, &mut current_pos)?;
-
-            // Write data
-            self.write_bytes(data, &mut current_pos)?;
-
-            // Update write position
-            std::sync::atomic::fence(Ordering::Release);
-            self.write_pos.store(current_pos, Ordering::Release);
         }
 
-        Ok(())
-    }
-
-    /// Helper to write bytes handling wrap-around
-    unsafe fn write_bytes(&self, src: &[u8], current_pos: &mut usize) -> Result<()> {
-        let end_pos = *current_pos + src.len();
-        if end_pos > self.size {
-            let first_chunk = self.size - *current_pos;
-            let ptr = self.data.get_mut().add(*current_pos);
-            std::ptr::copy_nonoverlapping(src.as_ptr(), ptr, first_chunk);
-
-            let remaining = src.len() - first_chunk;
-            let ptr = self.data.get_mut();
-            std::ptr::copy_nonoverlapping(src.as_ptr().add(first_chunk), ptr, remaining);
-
-            *current_pos = remaining;
-        } else {
-            let ptr = self.data.get_mut().add(*current_pos);
-            std::ptr::copy_nonoverlapping(src.as_ptr(), ptr, src.len());
-            *current_pos = (*current_pos + src.len()) % self.size;
-        }
-        Ok(())
-    }
-
-    /// Read data from the ring buffer starting from a given position and sequence number
-    pub fn read(&self, read_pos: &mut usize, last_seq: &mut u64) -> Result<Vec<u8>> {
-        let start = Instant::now();
-        let mut _guard = self.lock.lock();
-
-        while start.elapsed() < MAX_WAIT_TIME {
-            let write_pos = self.write_pos.load(Ordering::Acquire);
-
-            if *read_pos == write_pos {
-                // Buffer is empty
-                return Err(Error::BufferEmpty);
-            }
-
-            // Read sequence number
-            let mut seq_bytes = [0u8; 8];
-            self.read_bytes(&mut seq_bytes, *read_pos)?;
-            let seq = u64::from_le_bytes(seq_bytes);
-
-            // Check if data has been overwritten
-            if seq <= *last_seq {
-                // Data has been overwritten, need to adjust read_pos
-                *read_pos = write_pos;
-                *last_seq = seq;
-                return Err(Error::DataOverwritten);
-            }
-
-            *last_seq = seq;
-            *read_pos = (*read_pos + size_of::<u64>()) % self.size;
-
-            // Read length prefix
-            let mut length_bytes = [0u8; 4];
-            self.read_bytes(&mut length_bytes, *read_pos)?;
-            let data_len = u32::from_le_bytes(length_bytes) as usize;
-            *read_pos = (*read_pos + size_of::<u32>()) % self.size;
-
-            // Read data
-            let mut data = vec![0u8; data_len];
-            self.read_bytes(&mut data, *read_pos)?;
-            *read_pos = (*read_pos + data_len) % self.size;
-
-            return Ok(data);
-        }
-
-        Err(Error::Timeout)
-    }
-
-    /// Helper method to read bytes handling wrap-around
-    fn read_bytes(&self, buf: &mut [u8], read_pos: usize) -> Result<()> {
-        let end_pos = read_pos + buf.len();
-
+        // Write length and data
+        let len_bytes = (data.len() as u32).to_le_bytes();
         unsafe {
-            if end_pos > self.size {
-                let first_chunk = self.size - read_pos;
-                let ptr = self.data.get().add(read_pos);
-                std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), first_chunk);
-
-                let remaining = buf.len() - first_chunk;
-                let ptr = self.data.get();
-                std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr().add(first_chunk), remaining);
-            } else {
-                let ptr = self.data.get().add(read_pos);
-                std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), buf.len());
-            }
+            self.write_bytes(&len_bytes, &mut current_pos)?;
+            self.write_bytes(data, &mut current_pos)?;
         }
+
+        // Update write position
+        self.metadata
+            .write_pos
+            .store(current_pos, Ordering::Release);
 
         Ok(())
     }
 
-    /// Get the current write position
-    pub fn write_pos(&self) -> usize {
-        self.write_pos.load(Ordering::Acquire)
+    unsafe fn write_bytes(&self, src: &[u8], current_pos: &mut usize) -> Result<()> {
+        let dst = self.data.as_ptr().add(*current_pos);
+        ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+        *current_pos = (*current_pos + src.len()) % self.size;
+        Ok(())
     }
 
-    /// Read a message from the ring buffer at the given position
+    fn read_bytes(&self, dst: &mut [u8], pos: usize) -> Result<()> {
+        unsafe {
+            let src = self.data.as_ptr().add(pos);
+            ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len());
+        }
+        Ok(())
+    }
+
+    pub fn write_pos(&self) -> usize {
+        self.metadata.write_pos.load(Ordering::Acquire)
+    }
+
+    pub fn oldest_read_pos(&self) -> usize {
+        // For now, just return 0 as we're not tracking individual read positions
+        0
+    }
+
     pub fn read_message(&self, read_pos: usize) -> Result<(Vec<u8>, usize)> {
+        let write_pos = self.metadata.write_pos.load(Ordering::Acquire);
+
+        if read_pos == write_pos {
+            debug!("Buffer is empty (read_pos == write_pos)");
+            return Err(Error::BufferEmpty);
+        }
+
         let mut current_pos = read_pos;
+        debug!("Starting read_message from position: {}", current_pos);
 
         // Read sequence number
         let mut seq_bytes = [0u8; 8];
         self.read_bytes(&mut seq_bytes, current_pos)?;
+        let sequence = u64::from_le_bytes(seq_bytes);
         current_pos = (current_pos + size_of::<u64>()) % self.size;
+        debug!(
+            "Read sequence number: {}, new pos: {}",
+            sequence, current_pos
+        );
 
         // Read length prefix
         let mut length_bytes = [0u8; 4];
@@ -266,93 +192,40 @@ impl RingBuffer {
         let data_len = u32::from_le_bytes(length_bytes) as usize;
         current_pos = (current_pos + size_of::<u32>()) % self.size;
 
+        if data_len == 0 || data_len > self.size {
+            error!(
+                "Invalid data length: {} (buffer size: {})",
+                data_len, self.size
+            );
+            return Err(Error::InvalidConfig("Invalid message size".into()));
+        }
+
         // Read data
         let mut data = vec![0u8; data_len];
         self.read_bytes(&mut data, current_pos)?;
         current_pos = (current_pos + data_len) % self.size;
+        debug!(
+            "Read {} bytes of data, final pos: {}",
+            data_len, current_pos
+        );
 
         Ok((data, current_pos))
     }
 
-    /// Get the buffer usage percentage
     pub fn usage(&self) -> f32 {
-        let write_pos = self.write_pos();
-        let oldest_read_pos = self.oldest_read_pos();
-        let used_space = if write_pos >= oldest_read_pos {
-            write_pos - oldest_read_pos
-        } else {
-            self.size - oldest_read_pos + write_pos
-        };
-        (used_space as f32) / (self.size as f32)
-    }
+        let write_pos = self.metadata.write_pos.load(Ordering::Relaxed);
+        let oldest_read = self.oldest_read_pos();
 
-    /// Get the oldest read position among all subscribers
-    pub fn oldest_read_pos(&self) -> usize {
-        let subscribers = self.subscribers.lock();
-        subscribers
-            .iter()
-            .map(|sub| sub.lock().read_pos)
-            .min()
-            .unwrap_or(0)
+        if write_pos >= oldest_read {
+            (write_pos - oldest_read) as f32 / self.size as f32
+        } else {
+            (self.size - (oldest_read - write_pos)) as f32 / self.size as f32
+        }
     }
 }
 
 impl Drop for RingBuffer {
     fn drop(&mut self) {
-        if self.owns_data {
-            unsafe {
-                let slice = std::slice::from_raw_parts_mut(self.data.get_mut(), self.size);
-                drop(Box::from_raw(slice as *mut [u8]));
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::thread;
-
-    #[test]
-    fn test_reader_detects_overwritten_data() {
-        let buffer_size = 128;
-        let ring_buffer = Arc::new(RingBuffer::new(buffer_size).unwrap());
-
-        // Add a subscriber
-        let subscriber = ring_buffer.add_subscriber();
-
-        // Write more data than the buffer can hold to force overwriting
-        for i in 0..20 {
-            let data = vec![i as u8; 20]; // Each message is 20 bytes + overhead
-            ring_buffer.write(&data).unwrap();
-        }
-
-        // Reader starts at initial position
-        let sub = Arc::clone(&subscriber);
-        let ring_buffer_clone = Arc::clone(&ring_buffer);
-
-        let reader = thread::spawn(move || {
-            let mut sub = sub.lock();
-            loop {
-                match sub.read(&ring_buffer_clone) {
-                    Ok(data) => {
-                        println!("Read data: {:?}", data);
-                    }
-                    Err(Error::DataOverwritten) => {
-                        println!("Data has been overwritten, read_pos adjusted");
-                        // Handle data loss
-                    }
-                    Err(Error::BufferEmpty) => {
-                        println!("No more data to read");
-                        break;
-                    }
-                    Err(e) => {
-                        panic!("Unexpected error: {:?}", e);
-                    }
-                }
-            }
-        });
-
-        reader.join().unwrap();
+        // No need to explicitly clean up metadata as it's in shared memory
     }
 }

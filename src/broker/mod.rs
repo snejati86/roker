@@ -145,26 +145,61 @@ impl Broker {
             return Err(Error::InvalidConfig("Buffer size cannot be zero".into()));
         }
 
-        let total_size = config.buffer_size + METADATA_SIZE;
+        let actual_buffer_size = largest_power_of_two(config.buffer_size);
+        let total_size = actual_buffer_size + METADATA_SIZE;
 
-        let shm = Arc::new(SharedMemory::new(&config.name, total_size)?);
-        let ptr = unsafe { shm.as_ptr() };
-        let ring_buffer =
-            unsafe { Arc::new(RingBuffer::from_raw_parts(ptr, config.buffer_size, false)?) };
+        // Try to connect first
+        match SharedMemory::connect(&config.name) {
+            Ok(shm) => {
+                info!("Found existing shared memory, connecting to it");
+                let shm = Arc::new(shm);
+                let ptr = unsafe { shm.as_ptr() };
+                let ring_buffer = unsafe {
+                    Arc::new(RingBuffer::from_raw_parts(ptr, actual_buffer_size, false)?)
+                };
 
-        let subscriptions = Arc::new(RwLock::new(HashMap::new()));
-        let counters = Arc::new(Counters {
-            messages_published: AtomicU64::new(0),
-            messages_delivered: AtomicU64::new(0),
-        });
+                let subscriptions = Arc::new(RwLock::new(HashMap::new()));
+                let counters = Arc::new(Counters {
+                    messages_published: AtomicU64::new(0),
+                    messages_delivered: AtomicU64::new(0),
+                });
 
-        Ok(Self {
-            shm,
-            ring_buffer,
-            subscriptions,
-            counters,
-            config,
-        })
+                Ok(Self {
+                    shm,
+                    ring_buffer,
+                    subscriptions,
+                    counters,
+                    config: BrokerConfig {
+                        buffer_size: actual_buffer_size,
+                        ..config
+                    },
+                })
+            }
+            Err(_) => {
+                info!("No existing shared memory found, creating new one");
+                let shm = Arc::new(SharedMemory::new(&config.name, total_size)?);
+                let ptr = unsafe { shm.as_ptr() };
+                let ring_buffer =
+                    unsafe { Arc::new(RingBuffer::from_raw_parts(ptr, actual_buffer_size, true)?) };
+
+                let subscriptions = Arc::new(RwLock::new(HashMap::new()));
+                let counters = Arc::new(Counters {
+                    messages_published: AtomicU64::new(0),
+                    messages_delivered: AtomicU64::new(0),
+                });
+
+                Ok(Self {
+                    shm,
+                    ring_buffer,
+                    subscriptions,
+                    counters,
+                    config: BrokerConfig {
+                        buffer_size: actual_buffer_size,
+                        ..config
+                    },
+                })
+            }
+        }
     }
 
     /// Connect to an existing broker
@@ -173,12 +208,16 @@ impl Broker {
 
         let shm = Arc::new(SharedMemory::connect(name)?);
         let ptr = unsafe { shm.as_ptr() };
-        let size = shm.len();
-        let ring_buffer = unsafe { Arc::new(RingBuffer::from_raw_parts(ptr, size, false)?) };
+        let total_size = shm.len();
+        let buffer_size = total_size - METADATA_SIZE;
+        let actual_buffer_size = largest_power_of_two(buffer_size);
+
+        let ring_buffer =
+            unsafe { Arc::new(RingBuffer::from_raw_parts(ptr, actual_buffer_size, false)?) };
 
         let config = BrokerConfig {
             name: name.to_string(),
-            buffer_size: size,
+            buffer_size: actual_buffer_size,
             ..Default::default()
         };
 
@@ -286,35 +325,71 @@ impl Broker {
 
     /// Publish a message
     pub fn publish(&self, message: Message) -> Result<()> {
-        debug!("Publishing message to topic: {}", message.topic.name());
+        debug!(
+            "Publishing message to topic: {} (payload size: {} bytes)",
+            message.topic.name(),
+            message.payload.len()
+        );
 
         let serialized =
             bincode::serialize(&message).map_err(|e| Error::SerializationError(e.to_string()))?;
 
+        debug!(
+            "Serialized message size: {} bytes, write_pos before: {}",
+            serialized.len(),
+            self.ring_buffer.write_pos()
+        );
+
         self.ring_buffer.write(&serialized)?;
+
+        debug!(
+            "Write successful, new write_pos: {}",
+            self.ring_buffer.write_pos()
+        );
+
         self.counters
             .messages_published
             .fetch_add(1, Ordering::Relaxed);
-
         Ok(())
     }
 
     /// Receive a message for a specific client
     pub fn receive(&self, client_id: &ClientId) -> Result<Message> {
         // Get client info and patterns
-        let (patterns, read_pos) = {
+        let (patterns, read_position) = {
             let subs = self.subscriptions.read();
             let client = subs
                 .get(client_id)
                 .ok_or_else(|| Error::ClientNotFound(client_id.as_str()))?;
+            debug!(
+                "Client {} reading from position: {}, write_pos is: {}",
+                client_id.as_str(),
+                client.read_position,
+                self.ring_buffer.write_pos()
+            );
             (client.patterns.clone(), client.read_position)
         };
 
         // Read message from client's position
-        let (data, new_pos) = self.ring_buffer.read_message(read_pos)?;
+        debug!(
+            "Attempting to read message from position: {}",
+            read_position
+        );
+        let (data, new_pos) = self.ring_buffer.read_message(read_position)?;
+        debug!(
+            "Read {} bytes of data, new read position: {}",
+            data.len(),
+            new_pos
+        );
 
-        let message: Message =
-            bincode::deserialize(&data).map_err(|e| Error::DeserializationError(e.to_string()))?;
+        let message: Message = bincode::deserialize(&data).map_err(|e| {
+            error!(
+                "Deserialization failed for data of length {}. First few bytes: {:?}",
+                data.len(),
+                &data.get(..20.min(data.len())).unwrap_or(&[])
+            );
+            Error::DeserializationError(e.to_string())
+        })?;
 
         // Check if message matches any patterns
         if patterns.iter().any(|p| p.matches(message.topic.name())) {
@@ -325,9 +400,10 @@ impl Broker {
             }
 
             debug!(
-                "Delivered message on topic {} to client {}",
+                "Delivered message on topic {} to client {}, new read_pos: {}",
                 message.topic.name(),
-                client_id.as_str()
+                client_id.as_str(),
+                new_pos
             );
 
             self.counters
@@ -336,11 +412,14 @@ impl Broker {
             Ok(message)
         } else {
             // If message doesn't match, advance read position and try again
+            debug!(
+                "Message topic didn't match patterns for client {}, advancing position to {}",
+                client_id.as_str(),
+                new_pos
+            );
             if let Some(client) = self.subscriptions.write().get_mut(client_id) {
                 client.read_position = new_pos;
             }
-            // Return BufferEmpty to indicate no matching message was found
-            // This will cause the caller to retry
             Err(Error::BufferEmpty)
         }
     }
@@ -373,4 +452,13 @@ impl Broker {
     pub fn debug_buffer_size(&self) -> usize {
         self.config.buffer_size
     }
+}
+
+// Add this helper function to find the largest power of 2 that fits in a number
+fn largest_power_of_two(n: usize) -> usize {
+    let mut power = 1;
+    while power * 2 <= n {
+        power *= 2;
+    }
+    power
 }

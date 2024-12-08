@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
-const BROKER_NAME: &str = "image_broker";
-const BUFFER_SIZE: usize = 16777216; // 16MB (2^24)
+const BROKER_NAME: &str = "image_broker2";
+const BUFFER_SIZE: usize = 1024 * 1024 * 16; // 16MB (2^24)
 const IMAGE_TOPIC: &str = "/images/broadcast";
 
 fn main() {
@@ -49,6 +49,7 @@ fn run_publisher(image_path: &str) {
             return;
         }
     };
+    println!("Broker created with buffer size");
 
     // Read image file
     let image_data = match fs::read(image_path) {
@@ -85,7 +86,7 @@ fn run_viewer(save_dir: &str, viewer_id: &str) {
             return;
         }
     };
-
+    println!("Connected to broker");
     // Register as a client
     let client_id = match broker.register_client(&format!("viewer_{}", viewer_id)) {
         Ok(id) => id,
@@ -124,6 +125,10 @@ fn run_viewer(save_dir: &str, viewer_id: &str) {
                     Ok(_) => println!("Saved image to: {}", filename.display()),
                     Err(e) => println!("Failed to save image: {}", e),
                 }
+            }
+            Err(roker::Error::BufferEmpty) => {
+                // Buffer is empty, just wait quietly
+                thread::sleep(Duration::from_millis(100));
             }
             Err(e) => {
                 println!("Error receiving message: {}", e);
