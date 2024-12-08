@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BROKER_NAME: &str = "telemetry_broker";
-const BUFFER_SIZE: usize = 1024 * 1024; // 1MB buffer
+const BUFFER_SIZE: usize = 1048576; // 1MB (2^20)
 
 #[derive(Serialize, Deserialize, Debug)]
 struct TemperatureReading {

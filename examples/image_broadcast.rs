@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 const BROKER_NAME: &str = "image_broker";
-const BUFFER_SIZE: usize = 10 * 1024 * 1024; // 10MB buffer
+const BUFFER_SIZE: usize = 16777216; // 16MB (2^24)
 const IMAGE_TOPIC: &str = "/images/broadcast";
 
 fn main() {
