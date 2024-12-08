@@ -42,6 +42,7 @@ unsafe impl Send for RingBuffer {}
 unsafe impl Sync for RingBuffer {}
 
 impl RingBuffer {
+    #[cfg(test)]
     /// Create a new ring buffer with the given size
     pub fn new(size: usize) -> Result<Self> {
         if size == 0 || !size.is_power_of_two() {
@@ -199,6 +200,7 @@ impl RingBuffer {
         Err(Error::Timeout)
     }
 
+    #[cfg(test)]
     /// Read data from the ring buffer with timeout
     pub fn read(&self, buf: &mut [u8]) -> Result<()> {
         let start = Instant::now();
@@ -440,7 +442,7 @@ impl Drop for RingBuffer {
         if self.owns_data {
             unsafe {
                 let slice = std::slice::from_raw_parts_mut(self.data.get_mut(), self.size);
-                Box::from_raw(slice as *mut [u8]);
+                drop(Box::from_raw(slice as *mut [u8]));
             }
         }
     }
