@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const MAX_WAIT_TIME: Duration = Duration::from_secs(5);
@@ -33,6 +33,7 @@ pub struct RingBuffer {
     read_pos: AtomicUsize,
     write_pos: AtomicUsize,
     lock: Mutex<()>,
+    owns_data: bool,
 }
 
 unsafe impl Send for RingBuffer {}
@@ -54,11 +55,23 @@ impl RingBuffer {
             read_pos: AtomicUsize::new(0),
             write_pos: AtomicUsize::new(0),
             lock: Mutex::new(()),
+            owns_data: true,
         })
     }
 
     /// Create a ring buffer from raw parts
-    pub unsafe fn from_raw_parts(ptr: *mut u8, size: usize) -> Result<Self> {
+    ///
+    /// # Arguments
+    /// * `ptr` - Pointer to the buffer memory
+    /// * `size` - Size of the buffer (must be power of 2)
+    /// * `owns_memory` - Whether this RingBuffer should take ownership of the memory
+    ///
+    /// # Safety
+    /// - The caller must ensure the pointer is valid and properly aligned
+    /// - If `owns_memory` is true, the memory must have been allocated with the same
+    ///   allocator that Rust's global allocator would use
+    /// - The caller must ensure the memory won't be freed while this RingBuffer exists
+    pub unsafe fn from_raw_parts(ptr: *mut u8, size: usize, owns_memory: bool) -> Result<Self> {
         if size == 0 || !size.is_power_of_two() {
             return Err(Error::InvalidBufferSize);
         }
@@ -69,6 +82,7 @@ impl RingBuffer {
             read_pos: AtomicUsize::new(0),
             write_pos: AtomicUsize::new(0),
             lock: Mutex::new(()),
+            owns_data: owns_memory,
         })
     }
 
@@ -81,11 +95,11 @@ impl RingBuffer {
     pub fn write(&self, data: &[u8]) -> Result<()> {
         let start = Instant::now();
         let _guard = self.lock.lock();
-        
+
         while start.elapsed() < MAX_WAIT_TIME {
             let write_pos = self.write_pos.load(Ordering::Relaxed);
             let read_pos = self.read_pos.load(Ordering::Relaxed);
-            
+
             let available = if write_pos >= read_pos {
                 if read_pos == 0 {
                     self.size - write_pos - 1
@@ -104,7 +118,7 @@ impl RingBuffer {
                         let first_chunk = self.size - write_pos;
                         let ptr = self.data.get_mut().add(write_pos);
                         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, first_chunk);
-                        
+
                         let ptr = self.data.get_mut();
                         std::ptr::copy_nonoverlapping(
                             data[first_chunk..].as_ptr(),
@@ -117,7 +131,8 @@ impl RingBuffer {
                     }
                 }
 
-                self.write_pos.store((write_pos + data.len()) % self.size, Ordering::Release);
+                self.write_pos
+                    .store((write_pos + data.len()) % self.size, Ordering::Release);
                 return Ok(());
             }
 
@@ -131,11 +146,11 @@ impl RingBuffer {
     pub fn read(&self, buf: &mut [u8]) -> Result<()> {
         let start = Instant::now();
         let _guard = self.lock.lock();
-        
+
         while start.elapsed() < MAX_WAIT_TIME {
             let write_pos = self.write_pos.load(Ordering::Acquire);
             let read_pos = self.read_pos.load(Ordering::Relaxed);
-            
+
             let available = if write_pos >= read_pos {
                 write_pos - read_pos
             } else {
@@ -152,7 +167,7 @@ impl RingBuffer {
                         let first_chunk = self.size - read_pos;
                         let ptr = self.data.get_mut().add(read_pos);
                         std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), first_chunk);
-                        
+
                         let ptr = self.data.get_mut();
                         std::ptr::copy_nonoverlapping(
                             ptr,
@@ -165,7 +180,8 @@ impl RingBuffer {
                     }
                 }
 
-                self.read_pos.store((read_pos + to_read) % self.size, Ordering::Release);
+                self.read_pos
+                    .store((read_pos + to_read) % self.size, Ordering::Release);
                 return Ok(());
             }
 
@@ -179,7 +195,7 @@ impl RingBuffer {
     pub fn usage(&self) -> f32 {
         let write_pos = self.write_pos.load(Ordering::Relaxed);
         let read_pos = self.read_pos.load(Ordering::Relaxed);
-        
+
         let used = if write_pos >= read_pos {
             write_pos - read_pos
         } else {
@@ -192,11 +208,14 @@ impl RingBuffer {
 
 impl Drop for RingBuffer {
     fn drop(&mut self) {
-        unsafe {
-            let ptr = self.data.get_mut();
-            if !ptr.is_null() {
-                let slice = std::slice::from_raw_parts_mut(ptr, self.size);
-                drop(Box::from_raw(slice));
+        if self.owns_data {
+            unsafe {
+                let ptr = self.data.get_mut();
+                if !ptr.is_null() {
+                    // Reconstruct the original Box<[u8]> using a pointer to the slice
+                    let slice_ptr = std::ptr::slice_from_raw_parts_mut(ptr, self.size);
+                    drop(Box::from_raw(slice_ptr));
+                }
             }
         }
     }

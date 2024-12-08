@@ -7,10 +7,10 @@ use parking_lot::{Mutex, RwLock};
 use ring_buffer::RingBuffer;
 use shared_memory::{Shmem, ShmemConf};
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
-use std::ffi::CString;
 
 const METADATA_SIZE: usize = 1024;
 
@@ -50,9 +50,20 @@ impl SharedMemory {
 
         // Create new shared memory with platform-specific configuration
         let shmem = if cfg!(target_os = "macos") {
-            // On macOS, use anonymous shared memory
+            // On macOS, use named shared memory with a fixed path prefix
+            let shm_path = format!("/tmp/{}", name);
+            let c_path = CString::new(shm_path.as_bytes()).map_err(|_| {
+                Error::SharedMemoryCreation(shared_memory::ShmemError::MapCreateFailed(0))
+            })?;
+
+            // Try to unlink any existing shared memory
+            unsafe {
+                libc::shm_unlink(c_path.as_ptr());
+            }
+
             ShmemConf::new()
                 .size(size)
+                .os_id(&shm_path)
                 .create()
                 .map_err(Error::SharedMemoryCreation)?
         } else {
@@ -62,7 +73,7 @@ impl SharedMemory {
                 .create()
                 .map_err(Error::SharedMemoryCreation)?
         };
-        
+
         Ok(Self {
             shmem: Mutex::new(shmem),
             name: name.to_string(),
@@ -73,9 +84,10 @@ impl SharedMemory {
     fn connect(name: &str) -> Result<Self> {
         // Connect to shared memory with platform-specific configuration
         let shmem = if cfg!(target_os = "macos") {
-            // On macOS, use anonymous shared memory
+            // On macOS, use named shared memory with a fixed path prefix
+            let shm_path = format!("/tmp/{}", name);
             ShmemConf::new()
-                .size(4096) // Default size for connection
+                .os_id(&shm_path)
                 .open()
                 .map_err(Error::SharedMemoryCreation)?
         } else {
@@ -84,7 +96,7 @@ impl SharedMemory {
                 .open()
                 .map_err(Error::SharedMemoryCreation)?
         };
-        
+
         Ok(Self {
             shmem: Mutex::new(shmem),
             name: name.to_string(),
@@ -136,7 +148,8 @@ impl Broker {
 
         let shm = Arc::new(SharedMemory::new(&config.name, total_size)?);
         let ptr = unsafe { shm.as_ptr() };
-        let ring_buffer = unsafe { Arc::new(RingBuffer::from_raw_parts(ptr, config.buffer_size)?) };
+        let ring_buffer =
+            unsafe { Arc::new(RingBuffer::from_raw_parts(ptr, config.buffer_size, false)?) };
 
         let subscriptions = Arc::new(RwLock::new(HashMap::new()));
         let counters = Arc::new(Counters {
@@ -160,7 +173,7 @@ impl Broker {
         let shm = Arc::new(SharedMemory::connect(name)?);
         let ptr = unsafe { shm.as_ptr() };
         let size = shm.len();
-        let ring_buffer = unsafe { Arc::new(RingBuffer::from_raw_parts(ptr, size)?) };
+        let ring_buffer = unsafe { Arc::new(RingBuffer::from_raw_parts(ptr, size, false)?) };
 
         let config = BrokerConfig {
             name: name.to_string(),
@@ -186,7 +199,9 @@ impl Broker {
     /// Register a new client
     pub fn register_client(&self, name: &str) -> Result<ClientId> {
         let client_id = ClientId::new();
-        let subs = self.subscriptions.read();
+
+        // Acquire write lock directly
+        let mut subs = self.subscriptions.write();
 
         if subs.len() >= self.config.max_clients {
             error!("Client limit exceeded: {}", self.config.max_clients);
@@ -195,7 +210,6 @@ impl Broker {
 
         debug!("Registering new client: {} ({})", name, client_id.as_str());
 
-        let mut subs = self.subscriptions.write();
         subs.insert(
             client_id.clone(),
             ClientInfo {
@@ -308,13 +322,13 @@ impl Broker {
             if let Some(client) = self.subscriptions.write().get_mut(client_id) {
                 client.last_seen = std::time::Instant::now();
             }
-            
+
             debug!(
                 "Delivering message on topic {} to client {}",
                 message.topic.name(),
                 client_id.as_str()
             );
-            
+
             self.counters
                 .messages_delivered
                 .fetch_add(1, Ordering::Relaxed);

@@ -1,11 +1,11 @@
 use shared_memory_broker::{Broker, BrokerConfig, Message, Topic};
-use std::time::{Duration, Instant};
 use std::thread;
+use std::time::{Duration, Instant};
 
 #[test]
 fn test_basic_functionality() {
     println!("Starting basic functionality test");
-    
+
     // Create broker with minimal configuration
     let config = BrokerConfig {
         name: "broker1".to_string(),
@@ -13,7 +13,7 @@ fn test_basic_functionality() {
         max_clients: 10,
         max_subscriptions_per_client: 5,
     };
-    
+
     println!("Creating broker");
     let broker = match Broker::new(config) {
         Ok(b) => b,
@@ -41,7 +41,7 @@ fn test_basic_functionality() {
     println!("Creating and publishing message");
     let topic = Topic::new("/test/topic").expect("Failed to create topic");
     let message = Message::new(topic, b"test message".to_vec());
-    
+
     if let Err(e) = broker.publish(message.clone()) {
         println!("Failed to publish message: {:?}", e);
         panic!("Message publication failed: {}", e);
@@ -66,7 +66,7 @@ fn test_basic_functionality() {
 #[test]
 fn test_cleanup() {
     println!("Starting cleanup test");
-    
+
     let name = "broker2".to_string();
     let config = BrokerConfig {
         name: name.clone(),
@@ -86,8 +86,12 @@ fn test_cleanup() {
 
     // Do a simple operation to verify it works
     println!("Testing first broker");
-    let client_id = broker.register_client("test").expect("Failed to register client");
-    broker.subscribe(&client_id, "/test").expect("Failed to subscribe");
+    let client_id = broker
+        .register_client("test")
+        .expect("Failed to register client");
+    broker
+        .subscribe(&client_id, "/test")
+        .expect("Failed to subscribe");
 
     // Drop the broker explicitly
     println!("Dropping first broker");

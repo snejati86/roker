@@ -8,7 +8,7 @@ use tracing::{debug, error, info};
 #[derive(Clone)]
 pub struct Publisher {
     broker: Arc<Broker>,
-    #[allow(dead_code)]  // This field is used for identification but not directly accessed
+    #[allow(dead_code)] // This field is used for identification but not directly accessed
     client_id: ClientId,
 }
 

@@ -8,8 +8,8 @@ pub mod client;
 pub mod error;
 mod topic;
 
-use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
+use std::time::SystemTime;
 use uuid::Uuid;
 
 pub use broker::Broker;
