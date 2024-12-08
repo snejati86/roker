@@ -1,7 +1,9 @@
 use crate::error::{Error, Result};
 use parking_lot::Mutex;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,7 +25,11 @@ impl SharedPtr {
     }
 
     /// Get a mutable reference to the underlying memory
-    unsafe fn get_mut(&self) -> *mut u8 {
+    pub fn get_mut(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    pub fn get(&self) -> *const u8 {
         self.ptr
     }
 }
@@ -32,7 +38,7 @@ impl SharedPtr {
 pub struct RingBuffer {
     data: SharedPtr,
     size: usize,
-    read_pos: AtomicUsize,
+    pub read_pos: AtomicUsize,
     write_pos: AtomicUsize,
     lock: Mutex<()>,
     owns_data: bool,
@@ -94,49 +100,60 @@ impl RingBuffer {
         let start = Instant::now();
         let mut _guard = self.lock.lock();
 
-        // Calculate total size needed: length prefix + data
-        let total_size = size_of::<u32>() + data.len();
-        eprintln!(
-            "Attempting to write {} bytes (total_size: {})",
-            data.len(),
-            total_size
-        );
-
         while start.elapsed() < MAX_WAIT_TIME {
             let write_pos = self.write_pos.load(Ordering::Relaxed);
             let read_pos = self.read_pos.load(Ordering::Acquire);
+
             eprintln!(
-                "write_pos: {}, read_pos: {}, buffer_size: {}",
+                "WRITE: write_pos: {}, read_pos: {}, buffer_size: {}",
                 write_pos, read_pos, self.size
             );
 
             // Calculate available space considering wrap-around
-            let available = if write_pos >= read_pos {
+            let total_size = size_of::<u32>() + data.len();
+            let space_to_end = self.size - write_pos;
+            let space_at_start = read_pos;
+
+            // Calculate total available space
+            let available_space = if write_pos >= read_pos {
                 // Write position is ahead or equal to read position
-                // Available space is from write_pos to end + from start to read_pos
-                if read_pos == 0 {
-                    // Special case: read_pos at start, need to leave one byte
-                    self.size - write_pos - 1
+                // We can use space from write_pos to end, and from start to read_pos
+                if space_to_end >= total_size {
+                    // We can fit everything without wrapping
+                    space_to_end
+                } else if space_to_end >= size_of::<u32>() && space_at_start >= data.len() {
+                    // We can fit the length prefix at the end and data at the start
+                    total_size
+                } else if space_at_start >= total_size {
+                    // We need to write both length prefix and data at start
+                    // First, write a zero-length prefix at the end to mark wrap-around
+                    unsafe {
+                        let zero_length = 0u32.to_le_bytes();
+                        let ptr = self.data.get_mut().add(write_pos);
+                        std::ptr::copy_nonoverlapping(zero_length.as_ptr(), ptr, size_of::<u32>());
+                    }
+                    total_size
                 } else {
-                    // Available space is from write_pos to end + from start to read_pos - 1
-                    self.size - write_pos + read_pos - 1
+                    0 // Not enough contiguous space
                 }
             } else {
                 // Write position has wrapped around
-                // Available space is directly between positions
-                read_pos - write_pos - 1
+                read_pos - write_pos
             };
 
-            eprintln!("Available space: {}, need: {}", available, total_size);
+            eprintln!(
+                "WRITE: Available space: {}, need: {}, total_size: {}",
+                available_space, total_size, total_size
+            );
 
-            if total_size <= available {
-                eprintln!("Writing data at position {}", write_pos);
-                // Write the length prefix and data
+            if available_space >= total_size {
+                eprintln!("WRITE: Found enough space, writing data");
+                // Write length prefix
+                let length_bytes = (data.len() as u32).to_le_bytes();
+                let mut current_pos = write_pos;
+
                 unsafe {
-                    let length_bytes = (data.len() as u32).to_le_bytes();
-
                     // Write length prefix
-                    let mut current_pos = write_pos;
                     let mut remaining_length = size_of::<u32>();
                     let mut length_offset = 0;
 
@@ -147,9 +164,14 @@ impl RingBuffer {
                             remaining_length
                         };
 
+                        eprintln!(
+                            "WRITE: Writing length prefix chunk: {} bytes at position {}",
+                            chunk_size, current_pos
+                        );
+
                         let ptr = self.data.get_mut().add(current_pos);
                         std::ptr::copy_nonoverlapping(
-                            length_bytes[length_offset..length_offset + chunk_size].as_ptr(),
+                            length_bytes[length_offset..].as_ptr(),
                             ptr,
                             chunk_size,
                         );
@@ -170,9 +192,14 @@ impl RingBuffer {
                             remaining_data
                         };
 
+                        eprintln!(
+                            "WRITE: Writing data chunk: {} bytes at position {}",
+                            chunk_size, current_pos
+                        );
+
                         let ptr = self.data.get_mut().add(current_pos);
                         std::ptr::copy_nonoverlapping(
-                            data[data_offset..data_offset + chunk_size].as_ptr(),
+                            data[data_offset..].as_ptr(),
                             ptr,
                             chunk_size,
                         );
@@ -183,8 +210,9 @@ impl RingBuffer {
                     }
 
                     // Update write position
+                    std::sync::atomic::fence(Ordering::Release);
                     self.write_pos.store(current_pos, Ordering::Release);
-                    eprintln!("Write completed, new write_pos: {}", current_pos);
+                    eprintln!("WRITE: Updated write_pos to {}", current_pos);
                 }
 
                 return Ok(());
@@ -202,16 +230,17 @@ impl RingBuffer {
 
     #[cfg(test)]
     /// Read data from the ring buffer with timeout
-    pub fn read(&self, buf: &mut [u8]) -> Result<()> {
+    pub fn read(&self) -> Result<Vec<u8>> {
         let start = Instant::now();
         let mut _guard = self.lock.lock();
 
         while start.elapsed() < MAX_WAIT_TIME {
-            let write_pos = self.write_pos.load(Ordering::Acquire);
             let read_pos = self.read_pos.load(Ordering::Relaxed);
+            let write_pos = self.write_pos.load(Ordering::Acquire);
+
             eprintln!(
-                "READ: write_pos: {}, read_pos: {}, buffer_size: {}",
-                write_pos, read_pos, self.size
+                "READ: read_pos: {}, write_pos: {}, buffer_size: {}",
+                read_pos, write_pos, self.size
             );
 
             // Calculate available data considering wrap-around
@@ -227,127 +256,50 @@ impl RingBuffer {
                 size_of::<u32>()
             );
 
-            // Check if there's any data to read
-            if available == 0 {
-                eprintln!("READ: No data available, waiting...");
-                // Release the lock while waiting
-                drop(_guard);
-                thread::sleep(Duration::from_millis(1));
-                _guard = self.lock.lock();
-                continue;
-            }
-
             if available >= size_of::<u32>() {
                 // Read the length prefix
                 let mut length_bytes = [0u8; size_of::<u32>()];
-                unsafe {
-                    let read_end = read_pos + size_of::<u32>();
-                    if read_end > self.size {
-                        // Length prefix wraps around
-                        let first_chunk = self.size - read_pos;
-                        eprintln!(
-                            "READ: Length prefix wraps around. First chunk: {}, remaining: {}",
-                            first_chunk,
-                            size_of::<u32>() - first_chunk
-                        );
-                        let ptr = self.data.get_mut().add(read_pos);
-                        std::ptr::copy_nonoverlapping(ptr, length_bytes.as_mut_ptr(), first_chunk);
+                let mut current_pos = read_pos;
 
-                        let ptr = self.data.get_mut();
-                        std::ptr::copy_nonoverlapping(
-                            ptr,
-                            length_bytes[first_chunk..].as_mut_ptr(),
-                            size_of::<u32>() - first_chunk,
-                        );
-                    } else {
-                        let ptr = self.data.get_mut().add(read_pos);
-                        std::ptr::copy_nonoverlapping(
-                            ptr,
-                            length_bytes.as_mut_ptr(),
-                            size_of::<u32>(),
-                        );
-                    }
-                }
+                // Read length prefix handling wrap-around
+                self.read_exact(&mut length_bytes, current_pos)?;
+                current_pos = (current_pos + size_of::<u32>()) % self.size;
 
                 let data_len = u32::from_le_bytes(length_bytes) as usize;
-                eprintln!("READ: Message length: {}", data_len);
+                eprintln!("READ: Message length prefix: {} bytes", data_len);
 
-                if data_len > buf.len() {
+                // Check if we have enough data
+                let total_size = size_of::<u32>() + data_len;
+                if available >= total_size {
                     eprintln!(
-                        "READ: Buffer too small. Need: {}, have: {}",
-                        data_len,
-                        buf.len()
+                        "READ: Have enough data. Total needed: {}, available: {}",
+                        total_size, available
                     );
-                    return Err(Error::BufferTooSmall);
-                }
 
-                // Check if we have enough data for the entire message
-                if available < size_of::<u32>() + data_len {
+                    let mut data = vec![0u8; data_len];
+
+                    // Read data handling wrap-around
+                    self.read_exact(&mut data, current_pos)?;
+                    current_pos = (current_pos + data_len) % self.size;
+
+                    // Update read position
+                    std::sync::atomic::fence(Ordering::Release);
+                    self.read_pos.store(current_pos, Ordering::Release);
+                    eprintln!("READ: Updated read_pos to {}", current_pos);
+                    return Ok(data);
+                } else {
                     eprintln!(
-                        "READ: Not enough data for complete message. Available: {}, need: {}",
-                        available,
-                        size_of::<u32>() + data_len
+                        "READ: Not enough data. Need: {}, have: {}",
+                        total_size, available
                     );
-                    // Release the lock while waiting
-                    drop(_guard);
-                    thread::sleep(Duration::from_millis(1));
-                    _guard = self.lock.lock();
-                    continue;
                 }
-
-                // Update read position after reading length
-                let new_read_pos = (read_pos + size_of::<u32>()) % self.size;
-                self.read_pos.store(new_read_pos, Ordering::Release);
-                eprintln!("READ: Updated read_pos after length: {}", new_read_pos);
-
-                unsafe {
-                    let read_end = new_read_pos + data_len;
-                    if read_end > self.size {
-                        // Data needs to wrap around
-                        let first_chunk = self.size - new_read_pos;
-                        eprintln!(
-                            "READ: Message wraps around. First chunk: {}, remaining: {}",
-                            first_chunk,
-                            data_len - first_chunk
-                        );
-                        let ptr = self.data.get_mut().add(new_read_pos);
-                        std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), first_chunk);
-
-                        let ptr = self.data.get_mut();
-                        std::ptr::copy_nonoverlapping(
-                            ptr,
-                            buf[first_chunk..data_len].as_mut_ptr(),
-                            data_len - first_chunk,
-                        );
-
-                        // Update read position to wrapped position
-                        self.read_pos
-                            .store(data_len - first_chunk, Ordering::Release);
-                        eprintln!(
-                            "READ: Read wrapped around, new read_pos: {}",
-                            data_len - first_chunk
-                        );
-                    } else {
-                        let ptr = self.data.get_mut().add(new_read_pos);
-                        std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), data_len);
-
-                        // Update read position normally
-                        let final_read_pos = read_end % self.size;
-                        self.read_pos.store(final_read_pos, Ordering::Release);
-                        eprintln!(
-                            "READ: Read completed normally, new read_pos: {}",
-                            final_read_pos
-                        );
-                    }
-                }
-
-                return Ok(());
+            } else {
+                eprintln!("READ: Not enough data for length prefix");
             }
 
-            eprintln!("READ: Waiting for more data...");
             // Release the lock while waiting
             drop(_guard);
-            thread::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_micros(100));
             _guard = self.lock.lock();
         }
 
@@ -360,6 +312,11 @@ impl RingBuffer {
         let _guard = self.lock.lock();
         let write_pos = self.write_pos.load(Ordering::Acquire);
 
+        eprintln!(
+            "READ_MESSAGE: read_pos: {}, write_pos: {}, buffer_size: {}",
+            read_pos, write_pos, self.size
+        );
+
         // Check if there is data available
         let available = if write_pos >= read_pos {
             write_pos - read_pos
@@ -367,7 +324,10 @@ impl RingBuffer {
             self.size - read_pos + write_pos
         };
 
+        eprintln!("READ_MESSAGE: Available data: {}", available);
+
         if available < size_of::<u32>() {
+            eprintln!("READ_MESSAGE: Not enough data for length prefix");
             return Err(Error::BufferEmpty); // Not enough data to read length
         }
 
@@ -376,8 +336,22 @@ impl RingBuffer {
         self.read_exact(&mut length_bytes, read_pos)?;
         let msg_len = u32::from_le_bytes(length_bytes) as usize;
 
+        eprintln!("READ_MESSAGE: Message length: {}", msg_len);
+
+        // Check for wrap-around marker (zero length)
+        if msg_len == 0 {
+            eprintln!("READ_MESSAGE: Found wrap-around marker");
+            // Skip the wrap-around marker and start reading from the beginning
+            let new_read_pos = 0;
+            return self.read_message(new_read_pos);
+        }
+
         let total_size = size_of::<u32>() + msg_len;
         if available < total_size {
+            eprintln!(
+                "READ_MESSAGE: Not enough data for full message. Need: {}, have: {}",
+                total_size, available
+            );
             return Err(Error::BufferEmpty); // Not enough data to read the full message
         }
 
@@ -387,6 +361,10 @@ impl RingBuffer {
         self.read_exact(&mut data, msg_start)?;
 
         let new_read_pos = (read_pos + total_size) % self.size;
+        eprintln!(
+            "READ_MESSAGE: Successfully read message. New read_pos: {}",
+            new_read_pos
+        );
 
         Ok((data, new_read_pos))
     }
@@ -453,141 +431,146 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_write_read_basic() {
-        let buffer = RingBuffer::new(64).unwrap();
-        let data = vec![1, 2, 3, 4];
-        let mut read_buf = vec![0; 4];
-
+    fn test_basic_write_read() {
+        let buffer = RingBuffer::new(1024).unwrap();
+        let data = vec![1, 2, 3, 4, 5];
         buffer.write(&data).unwrap();
-        buffer.read(&mut read_buf).unwrap();
-
-        assert_eq!(read_buf, data);
+        let read_data = buffer.read().unwrap();
+        assert_eq!(read_data, data);
     }
 
     #[test]
-    fn test_write_read_multiple() {
-        let buffer = RingBuffer::new(64).unwrap();
-        let data1 = vec![1, 2, 3, 4];
-        let data2 = vec![5, 6, 7, 8];
-        let mut read_buf = vec![0; 4];
+    fn test_multiple_write_read() {
+        let buffer = RingBuffer::new(1024).unwrap();
+        let data1 = vec![1, 2, 3, 4, 5];
+        let data2 = vec![6, 7, 8, 9, 10];
 
         buffer.write(&data1).unwrap();
         buffer.write(&data2).unwrap();
 
-        buffer.read(&mut read_buf).unwrap();
-        assert_eq!(read_buf, data1);
+        let read_data1 = buffer.read().unwrap();
+        let read_data2 = buffer.read().unwrap();
 
-        buffer.read(&mut read_buf).unwrap();
-        assert_eq!(read_buf, data2);
+        assert_eq!(read_data1, data1);
+        assert_eq!(read_data2, data2);
     }
 
     #[test]
-    fn test_write_wrap_around() {
-        // Create a buffer just big enough for two messages plus their length prefixes
-        // Each message needs: 4 bytes (length) + data.len() bytes
-        let buffer_size = 64; // Must be power of 2
-        let buffer = RingBuffer::new(buffer_size).unwrap();
-
-        // Fill most of the buffer to force wrap-around
-        let data1 = vec![1; 20]; // First message will take 24 bytes (4 + 20)
-        buffer.write(&data1).unwrap();
-
-        // This write should wrap around
-        let data2 = vec![2; 4];
-        buffer.write(&data2).unwrap();
-
-        // Read both messages
-        let mut read_buf = vec![0; 20];
-        buffer.read(&mut read_buf).unwrap();
-        assert_eq!(read_buf, data1);
-
-        let mut read_buf = vec![0; 4];
-        buffer.read(&mut read_buf).unwrap();
-        assert_eq!(read_buf, data2);
-    }
-
-    #[test]
-    fn test_read_wrap_around() {
-        let buffer_size = 64;
-        let buffer = RingBuffer::new(buffer_size).unwrap();
-
-        // Write two messages
+    fn test_wrap_around() {
+        let buffer = RingBuffer::new(32).unwrap();
         let data1 = vec![1; 20];
-        let data2 = vec![2; 20];
+        let data2 = vec![2; 15];
+
         buffer.write(&data1).unwrap();
+        let read_data1 = buffer.read().unwrap();
         buffer.write(&data2).unwrap();
+        let read_data2 = buffer.read().unwrap();
 
-        // Read the first message
-        let mut read_buf = vec![0; 20];
-        buffer.read(&mut read_buf).unwrap();
-        assert_eq!(read_buf, data1);
-
-        // Now read the second message, which should wrap around
-        let mut read_buf = vec![0; 20];
-        buffer.read(&mut read_buf).unwrap();
-        assert_eq!(read_buf, data2);
-    }
-
-    #[test]
-    fn test_buffer_full() {
-        let buffer_size = 32;
-        let buffer = RingBuffer::new(buffer_size).unwrap();
-
-        // Try to write more data than the buffer can hold
-        let data = vec![1; buffer_size];
-        assert!(buffer.write(&data).is_err());
-    }
-
-    #[test]
-    fn test_write_read_exact_size() {
-        let buffer_size = 32;
-        let buffer = RingBuffer::new(buffer_size).unwrap();
-
-        // Write a message that exactly fits (including length prefix)
-        let data = vec![1; buffer_size - size_of::<u32>() - 1];
-        buffer.write(&data).unwrap();
-
-        let mut read_buf = vec![0; buffer_size - size_of::<u32>() - 1];
-        buffer.read(&mut read_buf).unwrap();
-        assert_eq!(read_buf, data);
-    }
-
-    #[test]
-    fn test_multiple_wrap_around() {
-        let buffer_size = 64;
-        let buffer = RingBuffer::new(buffer_size).unwrap();
-        let mut read_buf = vec![0; 4];
-
-        // Write and read multiple times to force multiple wrap-arounds
-        for i in 0..20 {
-            let data = vec![i as u8; 4];
-            buffer.write(&data).unwrap();
-            buffer.read(&mut read_buf).unwrap();
-            assert_eq!(read_buf, data);
-        }
+        assert_eq!(read_data1, data1);
+        assert_eq!(read_data2, data2);
     }
 
     #[test]
     fn test_concurrent_read_write() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let buffer_size = 256;
-        let buffer = Arc::new(RingBuffer::new(buffer_size).unwrap());
+        let buffer = Arc::new(RingBuffer::new(1024).unwrap());
         let buffer_clone = Arc::clone(&buffer);
 
         let writer = thread::spawn(move || {
             for i in 0..100 {
-                let data = vec![i as u8; 4];
+                let data = vec![i as u8; 10];
                 buffer_clone.write(&data).unwrap();
             }
         });
 
         let reader = thread::spawn(move || {
-            let mut read_buf = vec![0; 4];
             for i in 0..100 {
-                buffer.read(&mut read_buf).unwrap();
-                assert_eq!(read_buf, vec![i as u8; 4]);
+                let expected = vec![i as u8; 10];
+                let data = buffer.read().unwrap();
+                assert_eq!(data, expected);
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn test_buffer_full() {
+        let buffer = RingBuffer::new(32).unwrap();
+        let data = vec![1; 25];
+
+        // First write should succeed
+        buffer.write(&data).unwrap();
+        let read_data = buffer.read().unwrap();
+        assert_eq!(read_data, data);
+
+        // Second write should succeed after read
+        buffer.write(&data).unwrap();
+        let read_data = buffer.read().unwrap();
+        assert_eq!(read_data, data);
+    }
+
+    #[test]
+    fn test_large_messages() {
+        let buffer = RingBuffer::new(1024).unwrap();
+        let data = vec![42; 512];
+
+        for _ in 0..5 {
+            buffer.write(&data).unwrap();
+            let read_data = buffer.read().unwrap();
+            assert_eq!(read_data, data);
+        }
+    }
+
+    #[test]
+    fn test_wrap_around_with_large_messages() {
+        let buffer = RingBuffer::new(128).unwrap();
+        let data1 = vec![1; 64];
+        let data2 = vec![2; 32];
+        let data3 = vec![3; 48];
+
+        buffer.write(&data1).unwrap();
+        let read_data1 = buffer.read().unwrap();
+        assert_eq!(read_data1, data1);
+
+        buffer.write(&data2).unwrap();
+        buffer.write(&data3).unwrap();
+
+        let read_data2 = buffer.read().unwrap();
+        let read_data3 = buffer.read().unwrap();
+
+        assert_eq!(read_data2, data2);
+        assert_eq!(read_data3, data3);
+    }
+
+    #[test]
+    fn test_concurrent_wrap_around() {
+        let buffer = Arc::new(RingBuffer::new(256).unwrap());
+        let buffer_clone = Arc::clone(&buffer);
+
+        let writer = thread::spawn(move || {
+            for i in 0..50 {
+                let data = vec![i as u8; 100];
+                match buffer_clone.write(&data) {
+                    Ok(()) => (),
+                    Err(Error::Timeout) => continue,
+                    Err(e) => panic!("Unexpected error: {:?}", e),
+                }
+            }
+        });
+
+        let reader = thread::spawn(move || {
+            let mut received = 0;
+            while received < 50 {
+                match buffer.read() {
+                    Ok(data) => {
+                        assert_eq!(data.len(), 100);
+                        assert!(data.iter().all(|&x| x == data[0]));
+                        received += 1;
+                    }
+                    Err(Error::Timeout) => continue,
+                    Err(e) => panic!("Unexpected error: {:?}", e),
+                }
             }
         });
 

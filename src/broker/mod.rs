@@ -335,10 +335,12 @@ impl Broker {
                 .fetch_add(1, Ordering::Relaxed);
             Ok(message)
         } else {
-            // If message doesn't match, advance read position anyway
+            // If message doesn't match, advance read position and try again
             if let Some(client) = self.subscriptions.write().get_mut(client_id) {
                 client.read_position = new_pos;
             }
+            // Return BufferEmpty to indicate no matching message was found
+            // This will cause the caller to retry
             Err(Error::BufferEmpty)
         }
     }
@@ -355,5 +357,22 @@ impl Broker {
             messages_delivered: self.counters.messages_delivered.load(Ordering::Relaxed),
             buffer_usage: self.ring_buffer.usage(),
         }
+    }
+
+    /// Get the current write position (for debugging)
+    pub fn debug_write_pos(&self) -> usize {
+        self.ring_buffer.write_pos()
+    }
+
+    /// Get the current read position (for debugging)
+    pub fn debug_read_pos(&self) -> usize {
+        self.ring_buffer
+            .read_pos
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Get the buffer size (for debugging)
+    pub fn debug_buffer_size(&self) -> usize {
+        self.config.buffer_size
     }
 }
