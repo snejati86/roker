@@ -1,3 +1,4 @@
+use roker::error::Error as RokerError;
 use roker::{Broker, BrokerConfig, Message, Topic};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -145,5 +146,49 @@ fn test_cleanup() {
         }
 
         println!("Test completed successfully");
+    });
+}
+
+#[test]
+fn test_reader_invalidation_on_overwrite() {
+    run_with_timeout(Duration::from_secs(5), || {
+        let config = BrokerConfig {
+            name: "broker_invalidation".to_string(),
+            buffer_size: 128,
+            max_clients: 4,
+            max_subscriptions_per_client: 4,
+        };
+
+        let broker = Broker::new(config).expect("Failed to create broker");
+        let client_id = broker
+            .register_client("reader")
+            .expect("Failed to register client");
+        broker
+            .subscribe(&client_id, "/overwrite")
+            .expect("Failed to subscribe");
+
+        let topic = Topic::new("/overwrite").expect("Failed to create topic");
+
+        let first_payload = vec![0u8; 20];
+        let first_message = Message::new(topic.clone(), first_payload);
+        broker
+            .publish(first_message)
+            .expect("Failed to publish first message");
+
+        let large_payload = vec![1u8; 40];
+        let large_message = Message::new(topic.clone(), large_payload.clone());
+        broker
+            .publish(large_message)
+            .expect("Failed to publish large message");
+
+        match broker.receive(&client_id) {
+            Err(RokerError::DataOverwritten) => {}
+            other => panic!("Expected DataOverwritten error, got: {:?}", other),
+        }
+
+        let message = broker
+            .receive(&client_id)
+            .expect("Expected to receive latest message after invalidation");
+        assert_eq!(message.payload, large_payload);
     });
 }
