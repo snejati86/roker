@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use std::mem::size_of;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 /// A thread-safe wrapper for raw memory pointer
 pub(crate) struct SharedPtr {
@@ -112,10 +112,21 @@ impl RingBuffer {
         })
     }
 
-    pub fn write(&self, data: &[u8]) -> Result<()> {
+    pub fn write_with_callback<F>(&self, data: &[u8], mut on_before_write: F) -> Result<()>
+    where
+        F: FnMut(usize, usize),
+    {
+        let total_size = size_of::<u64>() + size_of::<u32>() + data.len();
+
+        if total_size > self.size {
+            return Err(Error::BufferTooSmall);
+        }
+
         let _guard = self.lock.lock();
 
         let write_pos = self.metadata.write_pos.load(Ordering::Relaxed);
+        on_before_write(write_pos, total_size);
+
         let sequence = self.metadata.sequence.fetch_add(1, Ordering::Relaxed);
 
         let mut current_pos = write_pos;
@@ -158,11 +169,6 @@ impl RingBuffer {
 
     pub fn write_pos(&self) -> usize {
         self.metadata.write_pos.load(Ordering::Acquire)
-    }
-
-    pub fn oldest_read_pos(&self) -> usize {
-        // For now, just return 0 as we're not tracking individual read positions
-        0
     }
 
     pub fn read_message(&self, read_pos: usize) -> Result<(Vec<u8>, usize)> {
@@ -210,22 +216,5 @@ impl RingBuffer {
         );
 
         Ok((data, current_pos))
-    }
-
-    pub fn usage(&self) -> f32 {
-        let write_pos = self.metadata.write_pos.load(Ordering::Relaxed);
-        let oldest_read = self.oldest_read_pos();
-
-        if write_pos >= oldest_read {
-            (write_pos - oldest_read) as f32 / self.size as f32
-        } else {
-            (self.size - (oldest_read - write_pos)) as f32 / self.size as f32
-        }
-    }
-}
-
-impl Drop for RingBuffer {
-    fn drop(&mut self) {
-        // No need to explicitly clean up metadata as it's in shared memory
     }
 }

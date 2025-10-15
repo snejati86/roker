@@ -25,6 +25,7 @@ struct ClientInfo {
     patterns: Vec<TopicMatcher>,
     last_seen: std::time::Instant,
     read_position: usize, // Track read position per client
+    invalidated: bool,
 }
 
 /// A thread-safe wrapper for shared memory
@@ -254,7 +255,8 @@ impl Broker {
             ClientInfo {
                 patterns: Vec::new(),
                 last_seen: std::time::Instant::now(),
-                read_position: self.ring_buffer.oldest_read_pos(), // Start at current write position
+                read_position: self.ring_buffer.write_pos(),
+                invalidated: false,
             },
         );
 
@@ -340,7 +342,10 @@ impl Broker {
             self.ring_buffer.write_pos()
         );
 
-        self.ring_buffer.write(&serialized)?;
+        self.ring_buffer
+            .write_with_callback(&serialized, |start_pos, bytes_written| {
+                self.handle_overwrite(start_pos, bytes_written);
+            })?;
 
         debug!(
             "Write successful, new write_pos: {}",
@@ -356,7 +361,7 @@ impl Broker {
     /// Receive a message for a specific client
     pub fn receive(&self, client_id: &ClientId) -> Result<Message> {
         // Get client info and patterns
-        let (patterns, read_position) = {
+        let (patterns, read_position, invalidated) = {
             let subs = self.subscriptions.read();
             let client = subs
                 .get(client_id)
@@ -367,8 +372,25 @@ impl Broker {
                 client.read_position,
                 self.ring_buffer.write_pos()
             );
-            (client.patterns.clone(), client.read_position)
+            (
+                client.patterns.clone(),
+                client.read_position,
+                client.invalidated,
+            )
         };
+
+        if invalidated {
+            if let Some(client) = self.subscriptions.write().get_mut(client_id) {
+                client.invalidated = false;
+                client.last_seen = std::time::Instant::now();
+            }
+            debug!(
+                "Client {} encountered overwritten data, read position reset to {}",
+                client_id.as_str(),
+                read_position
+            );
+            return Err(Error::DataOverwritten);
+        }
 
         // Read message from client's position
         debug!(
@@ -429,12 +451,16 @@ impl Broker {
         let subs = self.subscriptions.read();
         let total_subscriptions = subs.values().map(|client| client.patterns.len()).sum();
 
+        let oldest_read = self.oldest_read_position(&subs);
+        let write_pos = self.ring_buffer.write_pos();
+        let buffer_usage = calculate_usage(write_pos, oldest_read, self.config.buffer_size);
+
         BrokerStats {
             connected_clients: subs.len(),
             total_subscriptions,
             messages_published: self.counters.messages_published.load(Ordering::Relaxed),
             messages_delivered: self.counters.messages_delivered.load(Ordering::Relaxed),
-            buffer_usage: self.ring_buffer.usage(),
+            buffer_usage,
         }
     }
 
@@ -445,12 +471,50 @@ impl Broker {
 
     /// Get the current read position (for debugging)
     pub fn debug_read_pos(&self) -> usize {
-        self.ring_buffer.oldest_read_pos()
+        let subs = self.subscriptions.read();
+        self.oldest_read_position(&subs)
     }
 
     /// Get the buffer size (for debugging)
     pub fn debug_buffer_size(&self) -> usize {
         self.config.buffer_size
+    }
+
+    fn handle_overwrite(&self, start_pos: usize, bytes_written: usize) {
+        if bytes_written == 0 {
+            return;
+        }
+
+        let buffer_size = self.config.buffer_size;
+        let mut subs = self.subscriptions.write();
+        let end_pos = (start_pos + bytes_written) % buffer_size;
+
+        for (client_id, client) in subs.iter_mut() {
+            let distance = distance_between(client.read_position, start_pos, buffer_size);
+            let available = buffer_size.saturating_sub(distance);
+
+            if bytes_written > available {
+                debug!(
+                    "Invalidating client {}: read_pos={}, start_pos={}, end_pos={}, bytes_written={}, distance={}, buffer_size={}",
+                    client_id.as_str(),
+                    client.read_position,
+                    start_pos,
+                    end_pos,
+                    bytes_written,
+                    distance,
+                    buffer_size
+                );
+                client.read_position = start_pos;
+                client.invalidated = true;
+            }
+        }
+    }
+
+    fn oldest_read_position(&self, subs: &HashMap<ClientId, ClientInfo>) -> usize {
+        subs.values()
+            .map(|client| client.read_position)
+            .min()
+            .unwrap_or_else(|| self.ring_buffer.write_pos())
     }
 }
 
@@ -461,4 +525,24 @@ fn largest_power_of_two(n: usize) -> usize {
         power *= 2;
     }
     power
+}
+
+fn distance_between(start: usize, end: usize, buffer_size: usize) -> usize {
+    if end >= start {
+        end - start
+    } else {
+        buffer_size - (start - end)
+    }
+}
+
+fn calculate_usage(write_pos: usize, oldest_read: usize, buffer_size: usize) -> f32 {
+    if buffer_size == 0 {
+        return 0.0;
+    }
+
+    if write_pos >= oldest_read {
+        (write_pos - oldest_read) as f32 / buffer_size as f32
+    } else {
+        (buffer_size - (oldest_read - write_pos)) as f32 / buffer_size as f32
+    }
 }
